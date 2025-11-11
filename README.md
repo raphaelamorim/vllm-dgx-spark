@@ -235,7 +235,34 @@ echo $?  # 0 = all tests passed
 - Performance metrics
 - Recommendations for issues found
 
-#### 4. `benchmark_tokens_per_second.sh` - Performance Benchmarking
+#### 4. `monitor_gpu_during_inference.sh` - GPU Utilization Monitor
+
+Real-time GPU utilization monitoring during inference to identify performance bottlenecks (compute-bound vs network-bound).
+
+**Features:**
+- Monitors GPU utilization, memory, and power draw during inference
+- Runs sample inference request while collecting metrics
+- Calculates average GPU utilization
+- Determines if bottleneck is compute or network
+- Saves detailed logs for analysis
+
+**Usage:**
+```bash
+# Monitor GPU during inference
+./monitor_gpu_during_inference.sh [vllm_url]
+
+# Default URL is http://localhost:8000
+./monitor_gpu_during_inference.sh
+```
+
+**Output:**
+- Real-time GPU metrics (sampled every 0.5s)
+- Inference throughput (tokens/second)
+- Average GPU utilization analysis
+- Bottleneck identification (compute-bound vs network-bound)
+- Detailed log file saved
+
+#### 5. `benchmark_tokens_per_second.sh` - Performance Benchmarking
 
 Comprehensive token throughput benchmark that measures actual tokens/second performance under various workload scenarios.
 
@@ -852,6 +879,39 @@ docker rm ray-head
 - **Ray Version**: `2.51.0` (installed via pip, overrides container version)
 - **Python**: 3.x (from container)
 - **CUDA**: Included in NVIDIA container
+
+## TensorRT-LLM Alternative
+
+### ⚠️ Important: Known Compatibility Issues
+
+TensorRT-LLM has **critical compatibility issues** with DGX Spark (GB10/SM120 GPUs) in the current release (v1.2.0rc3). **System lockups and hangs are expected** in multi-node configurations.
+
+**Key Issues:**
+- **Issue #8474**: GB10/SM120 kernel support incomplete
+- **Issue #8781**: Multi-GPU CUDA graph hangs
+- **Issue #2953**: Multi-node memory corruption
+
+**Status**: Fixes merged to main branch but not yet in stable release.
+
+### Documentation
+
+For detailed analysis of TensorRT-LLM compatibility with DGX Spark:
+
+1. **`TENSORRT_SUMMARY.md`** - Executive summary and recommendations
+2. **`TENSORRT_LLM_ANALYSIS.md`** - Full technical analysis (10+ pages)
+3. **`test_tensorrt_llm_safe.sh`** - Safe testing script with built-in safeguards
+
+### Recommendation
+
+**For multi-node 70B models**: Continue using vLLM (stable, working correctly)
+
+**For single-GPU 8B models**: Test TensorRT-LLM cautiously with `./test_tensorrt_llm_safe.sh`
+
+**Long-term**: Wait for TensorRT-LLM v1.2.0 final or v1.3.0 with official GB10 support
+
+See `TENSORRT_SUMMARY.md` for complete analysis and decision matrix.
+
+---
 
 ## Contributing
 
