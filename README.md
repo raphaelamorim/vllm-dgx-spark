@@ -235,9 +235,65 @@ echo $?  # 0 = all tests passed
 - Performance metrics
 - Recommendations for issues found
 
+#### 4. `benchmark_tokens_per_second.sh` - Performance Benchmarking
+
+Comprehensive token throughput benchmark that measures actual tokens/second performance under various workload scenarios.
+
+**What it tests:**
+- Short prompt + short generation (100 tokens)
+- Short prompt + medium generation (300 tokens)
+- Short prompt + long generation (500 tokens)
+- Medium prompt + medium generation (400 tokens)
+- Long prompt + short generation (150 tokens)
+
+**Features:**
+- Automatic model detection
+- Warm-up phase to stabilize performance
+- Multiple requests per test for statistical reliability
+- Detailed metrics for each request
+- Average throughput calculations
+- Performance analysis with recommendations
+- Timestamped results file for historical tracking
+- Color-coded output for easy reading
+
+**Usage:**
+```bash
+# Basic usage (auto-detects local vLLM)
+./benchmark_tokens_per_second.sh
+
+# Specify vLLM URL
+./benchmark_tokens_per_second.sh http://192.168.1.100:8000
+
+# Specify URL and model name
+./benchmark_tokens_per_second.sh http://192.168.1.100:8000 "meta-llama/Llama-3.3-70B-Instruct"
+```
+
+**Output:**
+- Real-time throughput for each request
+- Average tokens/second for each test scenario
+- Final summary comparing all test scenarios
+- Saved detailed results: `benchmark_results_YYYYMMDD_HHMMSS.txt`
+- Performance analysis with warnings for low throughput
+
+**Example output:**
+```
+Test 1: Short Prompt, Short Generation
+  Request 1/5...
+    ✓ Generated 98 tokens in 1.23s
+      Throughput: 79.67 tokens/second
+
+Summary:
+  Average throughput: 82.45 tokens/second
+```
+
+**Performance expectations:**
+- **With InfiniBand/RoCE**: 50-100 tokens/s for Llama-3.3-70B
+- **With Ethernet fallback**: <10 tokens/s (indicates configuration problem)
+- Script will warn if throughput is unexpectedly low
+
 ### Diagnostic Scripts
 
-#### 4. `vllm_system_checkout.sh` - Comprehensive System Diagnostics
+#### 5. `vllm_system_checkout.sh` - Comprehensive System Diagnostics
 
 A complete diagnostic tool that collects all critical system information for troubleshooting performance and configuration issues.
 
@@ -278,7 +334,7 @@ export SECOND_DGX_HOST=spark-30e0
 - Debugging GPU utilization problems
 - Collecting information for support requests
 
-#### 5. `check_infiniband.sh` - InfiniBand/RoCE Diagnostics
+#### 6. `check_infiniband.sh` - InfiniBand/RoCE Diagnostics
 
 A focused diagnostic tool specifically for InfiniBand and RoCE network validation.
 
@@ -316,7 +372,7 @@ A focused diagnostic tool specifically for InfiniBand and RoCE network validatio
 
 ### Helper Scripts
 
-#### 6. `deploy_to_workers.sh` - Automated Worker Deployment
+#### 7. `deploy_to_workers.sh` - Automated Worker Deployment
 
 Utility script for deploying the repository to multiple worker nodes via SSH.
 
@@ -332,7 +388,7 @@ Utility script for deploying the repository to multiple worker nodes via SSH.
 ./deploy_to_workers.sh
 ```
 
-#### 7. `setup-env.sh` - Environment Setup
+#### 8. `setup-env.sh` - Environment Setup
 
 Sets up the common environment configuration used by other scripts.
 
