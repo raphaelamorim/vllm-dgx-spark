@@ -9,25 +9,26 @@ set -euo pipefail
 IMAGE="${IMAGE:-nvcr.io/nvidia/vllm:25.10-py3}"
 RAY_VERSION="${RAY_VERSION:-2.51.0}"
 HF_CACHE="${HF_CACHE:-/raid/hf-cache}"
+HF_TOKEN="${HF_TOKEN:-}"  # Set via: export HF_TOKEN=hf_xxx
+
+# Model configuration - MUST match the head node's MODEL setting
+MODEL="${MODEL:-openai/gpt-oss-120b}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Auto-detect Network Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DGX Spark uses RoCE (RDMA over Converged Ethernet) with ConnectX-7 NICs.
-# Interface names are enp1s0f1np1 or enP2p1s0f1np1, NOT ib0/ib1.
-# We prefer enp1* interfaces over enP2p* per NVIDIA's NCCL playbook.
-# WORKER_IP must be the 169.254.x.x link-local address on the RoCE interface.
+# Uses ibdev2netdev to discover active InfiniBand/RoCE interfaces.
+# The IP address on the IB/RoCE interface can be any valid IP (not limited
+# to link-local addresses). We rely on ibdev2netdev output to identify the
+# correct network interface for RDMA communication.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Discover primary RoCE interface using ibdev2netdev
-discover_roce_interface() {
+# Discover primary RoCE/IB interface using ibdev2netdev
+discover_ib_interface() {
   if command -v ibdev2netdev >/dev/null 2>&1; then
-    # Get active (Up) RoCE interfaces, preferring enp1* over enP2p*
+    # Get the first active (Up) interface from ibdev2netdev
     local active_line
-    active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | grep 'enp1' | head -n1)
-    if [ -z "$active_line" ]; then
-      active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | head -n1)
-    fi
+    active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print; exit}')
 
     if [ -n "$active_line" ]; then
       # Extract interface name (5th field, removing parentheses)
@@ -36,32 +37,25 @@ discover_roce_interface() {
   fi
 }
 
-# Get all active RoCE HCAs (comma-separated for NCCL_IB_HCA)
-discover_all_roce_hcas() {
+# Get all active IB/RoCE HCAs (comma-separated for NCCL_IB_HCA)
+discover_all_ib_hcas() {
   if command -v ibdev2netdev >/dev/null 2>&1; then
     ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $1}' | sort | tr '\n' ',' | sed 's/,$//'
   fi
 }
 
-# Get the 169.254.x.x link-local IP from a RoCE interface
-get_roce_ip() {
+# Get the first IPv4 address from an interface
+get_interface_ip() {
   local iface="$1"
   if [ -n "$iface" ]; then
-    # Prefer 169.254.x.x (link-local) addresses for RoCE
-    local ip
-    ip=$(ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | grep "^169\.254\." | head -1)
-    if [ -z "$ip" ]; then
-      # Fall back to any IPv4 address on the interface
-      ip=$(ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | head -1)
-    fi
-    echo "$ip"
+    ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | head -1
   fi
 }
 
-# Auto-detect primary RoCE interface
-PRIMARY_ROCE_IF=$(discover_roce_interface)
+# Auto-detect primary IB/RoCE interface
+PRIMARY_IB_IF=$(discover_ib_interface)
 
-# HEAD_IP is required - must be provided (it's the head node's RoCE IP)
+# HEAD_IP is required - must be provided (it's the head node's IB/RoCE IP)
 if [ -z "${HEAD_IP:-}" ]; then
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -72,15 +66,15 @@ if [ -z "${HEAD_IP:-}" ]; then
   echo ""
   echo "Prerequisites:"
   echo "  1. ✅ Head node must be running first"
-  echo "  2. ✅ You need the head node's RoCE/InfiniBand IP (169.254.x.x)"
+  echo "  2. ✅ You need the head node's InfiniBand/RoCE IP"
   echo ""
   echo "To find the head node IP:"
   echo "  - Check the output from start_head_vllm.sh (shown as 'Head IP')"
-  echo "  - OR run on head node: ibdev2netdev  # to find the RoCE interface"
-  echo "  - Then: ip addr show <interface> | grep 169.254"
+  echo "  - OR run on head node: ibdev2netdev  # to find the IB interface"
+  echo "  - Then: ip addr show <interface>"
   echo ""
   echo "Then set HEAD_IP and run this script:"
-  echo "  export HEAD_IP=169.254.x.x  # Use your head node's RoCE IP"
+  echo "  export HEAD_IP=<head_node_ib_ip>"
   echo "  bash start_worker_vllm.sh"
   echo ""
   echo "Note: Everything else (WORKER_IP, network interfaces) will be auto-detected!"
@@ -90,53 +84,57 @@ if [ -z "${HEAD_IP:-}" ]; then
   exit 1
 fi
 
-# Auto-detect WORKER_IP from RoCE interface (or use override)
+# Auto-detect WORKER_IP from IB interface (or use override)
 if [ -z "${WORKER_IP:-}" ]; then
-  if [ -n "${PRIMARY_ROCE_IF}" ]; then
-    WORKER_IP=$(get_roce_ip "${PRIMARY_ROCE_IF}")
+  if [ -n "${PRIMARY_IB_IF}" ]; then
+    WORKER_IP=$(get_interface_ip "${PRIMARY_IB_IF}")
   fi
   # Final fallback if auto-detection fails
   if [ -z "${WORKER_IP:-}" ]; then
-    echo "ERROR: Could not auto-detect WORKER_IP from RoCE interface."
+    echo "ERROR: Could not auto-detect WORKER_IP from InfiniBand/RoCE interface."
     echo ""
     echo "Please ensure:"
-    echo "  1. The 200 Gb cable is connected between Spark nodes"
-    echo "  2. Run 'ibdev2netdev' to verify RoCE interfaces are Up"
-    echo "  3. Check that a 169.254.x.x IP is assigned to the RoCE interface"
+    echo "  1. The InfiniBand/RoCE cable is connected between nodes"
+    echo "  2. Run 'ibdev2netdev' to verify IB/RoCE interfaces are Up"
+    echo "  3. Check that an IP is assigned to the IB/RoCE interface"
     echo ""
     echo "Then either:"
     echo "  - Fix the interface and re-run this script, OR"
-    echo "  - Set WORKER_IP manually: export WORKER_IP=169.254.x.x"
+    echo "  - Set WORKER_IP manually: export WORKER_IP=<your_ib_ip>"
     exit 1
   fi
 fi
 
-# Auto-detect network interfaces from active RoCE devices
+# Auto-detect network interfaces from active IB/RoCE devices
 if [ -z "${GLOO_IF:-}" ] || [ -z "${TP_IF:-}" ] || [ -z "${NCCL_IF:-}" ] || [ -z "${UCX_DEV:-}" ]; then
-  if [ -n "${PRIMARY_ROCE_IF}" ]; then
-    # Use primary RoCE interface for all NCCL/GLOO/TP/UCX communication
-    GLOO_IF="${GLOO_IF:-${PRIMARY_ROCE_IF}}"
-    TP_IF="${TP_IF:-${PRIMARY_ROCE_IF}}"
-    NCCL_IF="${NCCL_IF:-${PRIMARY_ROCE_IF}}"
-    UCX_DEV="${UCX_DEV:-${PRIMARY_ROCE_IF}}"
+  if [ -n "${PRIMARY_IB_IF}" ]; then
+    # Use primary IB interface for all NCCL/GLOO/TP/UCX communication
+    GLOO_IF="${GLOO_IF:-${PRIMARY_IB_IF}}"
+    TP_IF="${TP_IF:-${PRIMARY_IB_IF}}"
+    NCCL_IF="${NCCL_IF:-${PRIMARY_IB_IF}}"
+    UCX_DEV="${UCX_DEV:-${PRIMARY_IB_IF}}"
   else
-    # Fallback defaults if ibdev2netdev not available
-    GLOO_IF="${GLOO_IF:-enp1s0f1np1}"
-    TP_IF="${TP_IF:-enp1s0f1np1}"
-    NCCL_IF="${NCCL_IF:-enp1s0f1np1}"
-    UCX_DEV="${UCX_DEV:-enp1s0f1np1}"
+    # Error if no IB interface detected and not manually specified
+    echo "ERROR: No active InfiniBand/RoCE interface detected."
+    echo "Run 'ibdev2netdev' to check interface status."
+    exit 1
   fi
 fi
 
 # Auto-detect InfiniBand HCAs using ibdev2netdev (or use override)
 if [ -z "${NCCL_IB_HCA:-}" ]; then
-  IB_DEVICES=$(discover_all_roce_hcas)
+  IB_DEVICES=$(discover_all_ib_hcas)
   if [ -n "${IB_DEVICES}" ]; then
     NCCL_IB_HCA="${IB_DEVICES}"
   else
     # Fallback: use all IB devices from sysfs
     IB_DEVICES=$(ls -1 /sys/class/infiniband/ 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-    NCCL_IB_HCA="${IB_DEVICES:-mlx5_0,mlx5_1}"
+    NCCL_IB_HCA="${IB_DEVICES:-}"
+    if [ -z "${NCCL_IB_HCA}" ]; then
+      echo "ERROR: No InfiniBand HCAs detected."
+      echo "Run 'ibdev2netdev' or check /sys/class/infiniband/"
+      exit 1
+    fi
   fi
 fi
 
@@ -166,9 +164,16 @@ log "  Worker Name:   ${WORKER_NAME}"
 log "  Head IP:       ${HEAD_IP}"
 log "  Worker IP:     ${WORKER_IP} (auto-detected)"
 log "  Ray Version:   ${RAY_VERSION}"
+log "  Model:         ${MODEL}"
 log ""
-log "Network Configuration (auto-detected from RoCE):"
-log "  Primary RoCE IF: ${PRIMARY_ROCE_IF:-<not detected>}"
+if [ -n "${HF_TOKEN}" ]; then
+  log "  HF Auth:       ✅ Token provided"
+else
+  log "  HF Auth:       ⚠️  No token (gated models will fail)"
+fi
+log ""
+log "Network Configuration (auto-detected from ibdev2netdev):"
+log "  Primary IB IF:   ${PRIMARY_IB_IF:-<not detected>}"
 log "  GLOO Interface:  ${GLOO_IF}"
 log "  TP Interface:    ${TP_IF}"
 log "  NCCL Interface:  ${NCCL_IF}"
@@ -179,22 +184,22 @@ log ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 1/6: Testing connectivity to head"
-if ! nc -zv -w 3 "${HEAD_IP}" 6379 2>&1 | grep -q "succeeded"; then
-  error "Cannot reach Ray head at ${HEAD_IP}:6379. Check network connectivity and firewall."
+log "Step 1/7: Testing connectivity to head"
+if ! nc -zv -w 3 "${HEAD_IP}" 6380 2>&1 | grep -q "succeeded"; then
+  error "Cannot reach Ray head at ${HEAD_IP}:6380. Check network connectivity and firewall."
 fi
 log "  ✅ Head is reachable"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 2/6: Pulling Docker image"
+log "Step 2/7: Pulling Docker image"
 if ! docker pull "${IMAGE}"; then
   error "Failed to pull image ${IMAGE}"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 3/6: Cleaning old container"
+log "Step 3/7: Cleaning old container"
 if docker ps -a --format '{{.Names}}' | grep -qx "${WORKER_NAME}"; then
   log "  Removing existing container: ${WORKER_NAME}"
   docker rm -f "${WORKER_NAME}" >/dev/null
@@ -202,10 +207,18 @@ fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 4/6: Starting worker container"
+log "Step 4/7: Starting worker container"
 
-# Build environment variable args for RoCE/NCCL configuration
-# These are passed into the container to ensure NCCL uses the 200 Gb link
+# Build environment variable args for IB/NCCL configuration
+# These are passed into the container to ensure NCCL uses the IB/RoCE link
+# Note: We do NOT set HF_HUB_OFFLINE=1 because we need to download model weights first
+
+# Build HF token env arg if provided
+HF_TOKEN_ENV=""
+if [ -n "${HF_TOKEN}" ]; then
+  HF_TOKEN_ENV="-e HF_TOKEN=${HF_TOKEN}"
+fi
+
 docker run -d \
   --restart unless-stopped \
   --name "${WORKER_NAME}" \
@@ -230,6 +243,8 @@ docker run -d \
   -e NVIDIA_VISIBLE_DEVICES=all \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e RAY_memory_usage_threshold=0.995 \
+  -e HF_HOME=/root/.cache/huggingface \
+  ${HF_TOKEN_ENV} \
   "${IMAGE}" sleep infinity
 
 if ! docker ps | grep -q "${WORKER_NAME}"; then
@@ -240,7 +255,7 @@ log "  Container started successfully"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 5/6: Installing Ray ${RAY_VERSION}"
+log "Step 5/7: Installing Ray ${RAY_VERSION}"
 if ! docker exec "${WORKER_NAME}" bash -lc "pip install -q -U 'ray==${RAY_VERSION}'"; then
   error "Failed to install Ray"
 fi
@@ -255,27 +270,84 @@ log "  Ray ${INSTALLED_RAY_VERSION} installed"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 6/6: Joining Ray cluster"
+log "Step 6/7: Pre-downloading model weights"
+log "  Model: ${MODEL}"
+log "  This may take a while for large models on first download..."
+log ""
+log "  ⚠️  IMPORTANT: This model MUST match the head node's MODEL setting!"
+log ""
+
+# Build HF token arg if provided
+HF_TOKEN_ARG=""
+if [ -n "${HF_TOKEN}" ]; then
+  HF_TOKEN_ARG="--token ${HF_TOKEN}"
+fi
+
+# Download model with verification
+if ! docker exec "${WORKER_NAME}" bash -lc "
+  export HF_HOME=/root/.cache/huggingface
+  echo '  Downloading model files (excluding original/* and metal/* to save space)...'
+  huggingface-cli download ${MODEL} ${HF_TOKEN_ARG} --exclude 'original/*' --exclude 'metal/*' 2>&1 | tail -5
+"; then
+  error "Failed to download model ${MODEL}"
+fi
+
+# Verify model was downloaded by checking for config.json
+if ! docker exec "${WORKER_NAME}" bash -lc "
+  export HF_HOME=/root/.cache/huggingface
+  python3 -c \"
+from huggingface_hub import snapshot_download
+import os
+path = snapshot_download('${MODEL}', local_files_only=True)
+config_path = os.path.join(path, 'config.json')
+if not os.path.exists(config_path):
+    raise FileNotFoundError(f'Model config not found at {config_path}')
+print(f'  ✅ Model verified at: {path}')
+\"
+"; then
+  error "Model verification failed - config.json not found"
+fi
+
+log "  Model download complete and verified"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+log "Step 7/7: Joining Ray cluster"
 docker exec "${WORKER_NAME}" bash -lc "
   ray stop --force 2>/dev/null || true
-  ray start --address=${HEAD_IP}:6379 --node-ip-address=${WORKER_IP}
+  ray start --address=${HEAD_IP}:6380 --node-ip-address=${WORKER_IP}
 " >/dev/null
 
 log "  Worker started, waiting for cluster registration..."
 
-# Wait for worker to join cluster
-for i in {1..30}; do
-  if docker exec "${WORKER_NAME}" bash -lc "ray status --address=${HEAD_IP}:6379 2>/dev/null | grep -q 'Healthy:'" 2>/dev/null; then
-    log "  ✅ Worker connected to cluster (${i}s)"
+# Wait for worker to join cluster with progress indicator
+START_TIME=$(date +%s)
+CONNECTED=false
+for i in {1..60}; do
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+
+  if docker exec "${WORKER_NAME}" bash -lc "ray status --address=${HEAD_IP}:6380 2>/dev/null | grep -q 'Healthy:'" 2>/dev/null; then
+    echo ""
+    log "  ✅ Worker connected to cluster (${ELAPSED}s)"
+    CONNECTED=true
     break
   fi
-  if [ $i -eq 30 ]; then
-    log "  ⚠️  Worker may not be connected after 30s"
-    log "     Check cluster status from head:"
-    log "     docker exec ray-head ray status --address=127.0.0.1:6379"
-  fi
+
+  # Show spinner
+  SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  SPIN_CHAR="${SPINNER:$((i % 10)):1}"
+  printf "\r  %s Connecting to Ray cluster... [%ds elapsed]  " "${SPIN_CHAR}" "${ELAPSED}"
+
   sleep 1
 done
+
+if [ "${CONNECTED}" != "true" ]; then
+  echo ""
+  log "  ⚠️  Worker may not be connected after 60s"
+  log "     Check cluster status from head:"
+  log "     docker exec ray-head ray status --address=127.0.0.1:6380"
+fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -285,7 +357,7 @@ echo "✅ Worker ${WORKER_NAME} is ready!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "🔍 Verify from head node:"
-echo "  docker exec ray-head ray status --address=127.0.0.1:6379"
+echo "  docker exec ray-head ray status --address=127.0.0.1:6380"
 echo ""
 echo "📊 Expected output should show multiple 'Healthy' nodes"
 echo ""

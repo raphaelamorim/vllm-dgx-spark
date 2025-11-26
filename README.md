@@ -262,65 +262,96 @@ Real-time GPU utilization monitoring during inference to identify performance bo
 - Bottleneck identification (compute-bound vs network-bound)
 - Detailed log file saved
 
-#### 5. `benchmark_tokens_per_second.sh` - Performance Benchmarking
+#### 5. `benchmark_current_vllm.sh` - Comprehensive Performance Benchmarking
 
-Comprehensive token throughput benchmark that measures actual tokens/second performance under various workload scenarios.
+A comprehensive benchmark suite for any model currently loaded in vLLM. Auto-detects the model and runs latency, throughput, concurrent, streaming, and multi-domain performance tests.
 
-**What it tests:**
-- Short prompt + short generation (100 tokens)
-- Short prompt + medium generation (300 tokens)
-- Short prompt + long generation (500 tokens)
-- Medium prompt + medium generation (400 tokens)
-- Long prompt + short generation (150 tokens)
+**Tests performed:**
+- **Latency Test**: Measures response latency with minimal token generation
+- **Single Request Throughput**: Tokens/second for individual requests (256 tokens)
+- **Concurrent Request Performance**: Parallel request handling with aggregate throughput
+- **Long Generation Performance**: Sustained generation with 512 tokens
+- **Streaming Performance**: Time to first token measurement
+- **Multi-Domain Performance**: Tests across code, math, creative, technical, and general content
 
 **Features:**
-- Automatic model detection
-- Warm-up phase to stabilize performance
-- Multiple requests per test for statistical reliability
-- Detailed metrics for each request
-- Average throughput calculations
-- Performance analysis with recommendations
-- Timestamped results file for historical tracking
-- Color-coded output for easy reading
+- Automatic vLLM URL and model detection
+- Support for reasoning models (e.g., DeepSeek R1) with `reasoning_content` field
+- Configurable number of requests and concurrency level
+- Quick mode for faster results (`-q` flag)
+- JSON output export for integration with monitoring tools
+- Color-coded output with detailed metrics
+- Performance assessment with recommendations
 
 **Usage:**
 ```bash
-# Basic usage (auto-detects local vLLM)
-./benchmark_tokens_per_second.sh
+# Basic usage (auto-detects local vLLM and model)
+./benchmark_current_vllm.sh
 
 # Specify vLLM URL
-./benchmark_tokens_per_second.sh http://192.168.1.100:8000
+./benchmark_current_vllm.sh -u http://192.168.1.100:8000
 
-# Specify URL and model name
-./benchmark_tokens_per_second.sh http://192.168.1.100:8000 "meta-llama/Llama-3.3-70B-Instruct"
+# Quick mode with fewer requests
+./benchmark_current_vllm.sh --quick
+
+# Full benchmark with JSON output
+./benchmark_current_vllm.sh -n 10 -c 8 -o results.json
+
+# Show response content (verbose mode)
+./benchmark_current_vllm.sh -v
 ```
 
-**Output:**
-- Real-time throughput for each request
-- Average tokens/second for each test scenario
-- Final summary comparing all test scenarios
-- Saved detailed results: `benchmark_results_YYYYMMDD_HHMMSS.txt`
-- Performance analysis with warnings for low throughput
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-u, --url URL` | vLLM API URL (default: auto-detect) |
+| `-n, --requests N` | Number of test requests per benchmark (default: 5) |
+| `-c, --concurrency N` | Number of concurrent requests (default: 5) |
+| `-o, --output FILE` | Output results to JSON file |
+| `-q, --quick` | Quick mode: fewer requests, faster results |
+| `-v, --verbose` | Show response content in output |
+| `-h, --help` | Show help message |
 
 **Example output:**
 ```
-Test 1: Short Prompt, Short Generation
-  Request 1/5...
-    ✓ Generated 98 tokens in 1.23s
-      Throughput: 79.67 tokens/second
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+vLLM Model Benchmark
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  API URL:     http://localhost:8000
+  Requests:    5
+  Concurrency: 5
 
-Summary:
-  Average throughput: 82.45 tokens/second
+✓ vLLM is accessible
+✓ Model: meta-llama/Llama-3.3-70B-Instruct
+
+▶ Test 2: Single Request Throughput
+  Request 1/5 (256 tokens)... 256 tokens, 78.45 t/s
+  ...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Benchmark Summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Model:     meta-llama/Llama-3.3-70B-Instruct
+  Results:
+    Latency (avg):          0.892s
+    Single throughput:      78.45 t/s
+    Concurrent throughput:  142.30 t/s
+    Long gen throughput:    75.20 t/s
+    Multi-domain avg:       76.88 t/s
+
+  Performance Assessment:
+    ✓ Excellent throughput (78.45 t/s)
 ```
 
 **Performance expectations:**
-- **With InfiniBand/RoCE**: 50-100 tokens/s for Llama-3.3-70B
+- **With InfiniBand/RoCE**: 50-100 tokens/s for Llama-3.3-70B (single request)
+- **With InfiniBand/RoCE**: 100-200 tokens/s aggregate (concurrent requests)
 - **With Ethernet fallback**: <10 tokens/s (indicates configuration problem)
-- Script will warn if throughput is unexpectedly low
+- Script provides performance assessment with warnings for low throughput
 
 ### Diagnostic Scripts
 
-#### 5. `vllm_system_checkout.sh` - Comprehensive System Diagnostics
+#### 6. `vllm_system_checkout.sh` - Comprehensive System Diagnostics
 
 A complete diagnostic tool that collects all critical system information for troubleshooting performance and configuration issues.
 
@@ -361,7 +392,7 @@ export SECOND_DGX_HOST=spark-30e0
 - Debugging GPU utilization problems
 - Collecting information for support requests
 
-#### 6. `check_infiniband.sh` - InfiniBand/RoCE Diagnostics
+#### 7. `check_infiniband.sh` - InfiniBand/RoCE Diagnostics
 
 A focused diagnostic tool specifically for InfiniBand and RoCE network validation.
 
@@ -399,7 +430,7 @@ A focused diagnostic tool specifically for InfiniBand and RoCE network validatio
 
 ### Helper Scripts
 
-#### 7. `deploy_to_workers.sh` - Automated Worker Deployment
+#### 8. `deploy_to_workers.sh` - Automated Worker Deployment
 
 Utility script for deploying the repository to multiple worker nodes via SSH.
 
@@ -415,7 +446,7 @@ Utility script for deploying the repository to multiple worker nodes via SSH.
 ./deploy_to_workers.sh
 ```
 
-#### 8. `setup-env.sh` - Environment Setup
+#### 9. `setup-env.sh` - Environment Setup
 
 Sets up the common environment configuration used by other scripts.
 

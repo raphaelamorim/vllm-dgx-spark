@@ -13,7 +13,7 @@ HF_TOKEN="${HF_TOKEN:-}"  # Set via: export HF_TOKEN=hf_xxx
 RAY_VERSION="${RAY_VERSION:-2.51.0}"
 
 # Model configuration
-MODEL="${MODEL:-mistralai/Mixtral-8x7B-Instruct-v0.1}"
+MODEL="${MODEL:-openai/gpt-oss-120b}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"  # Default to 2 for distributed inference
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"   # Context length for Qwen2.5
 GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"  # Can be aggressive with smaller model
@@ -21,21 +21,18 @@ GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"  # Can be aggressive with smaller mod
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Auto-detect Network Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DGX Spark uses RoCE (RDMA over Converged Ethernet) with ConnectX-7 NICs.
-# Interface names are enp1s0f1np1 or enP2p1s0f1np1, NOT ib0/ib1.
-# We prefer enp1* interfaces over enP2p* per NVIDIA's NCCL playbook.
-# HEAD_IP must be the 169.254.x.x link-local address on the RoCE interface.
+# Uses ibdev2netdev to discover active InfiniBand/RoCE interfaces.
+# The IP address on the IB/RoCE interface can be any valid IP (not limited
+# to link-local addresses). We rely on ibdev2netdev output to identify the
+# correct network interface for RDMA communication.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Discover primary RoCE interface using ibdev2netdev
-discover_roce_interface() {
+# Discover primary RoCE/IB interface using ibdev2netdev
+discover_ib_interface() {
   if command -v ibdev2netdev >/dev/null 2>&1; then
-    # Get active (Up) RoCE interfaces, preferring enp1* over enP2p*
+    # Get the first active (Up) interface from ibdev2netdev
     local active_line
-    active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | grep 'enp1' | head -n1)
-    if [ -z "$active_line" ]; then
-      active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | head -n1)
-    fi
+    active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print; exit}')
 
     if [ -n "$active_line" ]; then
       # Extract interface name (5th field, removing parentheses)
@@ -44,93 +41,75 @@ discover_roce_interface() {
   fi
 }
 
-# Discover RoCE HCA name from ibdev2netdev
-discover_roce_hca() {
-  if command -v ibdev2netdev >/dev/null 2>&1; then
-    local active_line
-    active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | grep 'enp1' | head -n1)
-    if [ -z "$active_line" ]; then
-      active_line=$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {print;}' | head -n1)
-    fi
-
-    if [ -n "$active_line" ]; then
-      echo "$active_line" | awk '{print $1}'
-    fi
-  fi
-}
-
-# Get all active RoCE HCAs (comma-separated for NCCL_IB_HCA)
-discover_all_roce_hcas() {
+# Get all active IB/RoCE HCAs (comma-separated for NCCL_IB_HCA)
+discover_all_ib_hcas() {
   if command -v ibdev2netdev >/dev/null 2>&1; then
     ibdev2netdev 2>/dev/null | grep "(Up)" | awk '{print $1}' | sort | tr '\n' ',' | sed 's/,$//'
   fi
 }
 
-# Get the 169.254.x.x link-local IP from a RoCE interface
-get_roce_ip() {
+# Get the first IPv4 address from an interface
+get_interface_ip() {
   local iface="$1"
   if [ -n "$iface" ]; then
-    # Prefer 169.254.x.x (link-local) addresses for RoCE
-    local ip
-    ip=$(ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | grep "^169\.254\." | head -1)
-    if [ -z "$ip" ]; then
-      # Fall back to any IPv4 address on the interface
-      ip=$(ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | head -1)
-    fi
-    echo "$ip"
+    ip -o addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $4}' | cut -d'/' -f1 | head -1
   fi
 }
 
-# Auto-detect primary RoCE interface
-PRIMARY_ROCE_IF=$(discover_roce_interface)
+# Auto-detect primary IB/RoCE interface
+PRIMARY_IB_IF=$(discover_ib_interface)
 
-# Auto-detect HEAD_IP from RoCE interface (or use override)
+# Auto-detect HEAD_IP from IB interface (or use override)
 if [ -z "${HEAD_IP:-}" ]; then
-  if [ -n "${PRIMARY_ROCE_IF}" ]; then
-    HEAD_IP=$(get_roce_ip "${PRIMARY_ROCE_IF}")
+  if [ -n "${PRIMARY_IB_IF}" ]; then
+    HEAD_IP=$(get_interface_ip "${PRIMARY_IB_IF}")
   fi
   # Final fallback if auto-detection fails
   if [ -z "${HEAD_IP:-}" ]; then
-    echo "ERROR: Could not auto-detect HEAD_IP from RoCE interface."
+    echo "ERROR: Could not auto-detect HEAD_IP from InfiniBand/RoCE interface."
     echo ""
     echo "Please ensure:"
-    echo "  1. The 200 Gb cable is connected between Spark nodes"
-    echo "  2. Run 'ibdev2netdev' to verify RoCE interfaces are Up"
-    echo "  3. Check that a 169.254.x.x IP is assigned to the RoCE interface"
+    echo "  1. The InfiniBand/RoCE cable is connected between nodes"
+    echo "  2. Run 'ibdev2netdev' to verify IB/RoCE interfaces are Up"
+    echo "  3. Check that an IP is assigned to the IB/RoCE interface"
     echo ""
     echo "Then either:"
     echo "  - Fix the interface and re-run this script, OR"
-    echo "  - Set HEAD_IP manually: export HEAD_IP=169.254.x.x"
+    echo "  - Set HEAD_IP manually: export HEAD_IP=<your_ib_ip>"
     exit 1
   fi
 fi
 
-# Auto-detect network interfaces from active RoCE devices
+# Auto-detect network interfaces from active IB/RoCE devices
 if [ -z "${GLOO_IF:-}" ] || [ -z "${TP_IF:-}" ] || [ -z "${NCCL_IF:-}" ] || [ -z "${UCX_DEV:-}" ]; then
-  if [ -n "${PRIMARY_ROCE_IF}" ]; then
-    # Use primary RoCE interface for all NCCL/GLOO/TP/UCX communication
-    GLOO_IF="${GLOO_IF:-${PRIMARY_ROCE_IF}}"
-    TP_IF="${TP_IF:-${PRIMARY_ROCE_IF}}"
-    NCCL_IF="${NCCL_IF:-${PRIMARY_ROCE_IF}}"
-    UCX_DEV="${UCX_DEV:-${PRIMARY_ROCE_IF}}"
+  if [ -n "${PRIMARY_IB_IF}" ]; then
+    # Use primary IB interface for all NCCL/GLOO/TP/UCX communication
+    GLOO_IF="${GLOO_IF:-${PRIMARY_IB_IF}}"
+    TP_IF="${TP_IF:-${PRIMARY_IB_IF}}"
+    NCCL_IF="${NCCL_IF:-${PRIMARY_IB_IF}}"
+    UCX_DEV="${UCX_DEV:-${PRIMARY_IB_IF}}"
   else
-    # Fallback defaults if ibdev2netdev not available
-    GLOO_IF="${GLOO_IF:-enp1s0f1np1}"
-    TP_IF="${TP_IF:-enp1s0f1np1}"
-    NCCL_IF="${NCCL_IF:-enp1s0f1np1}"
-    UCX_DEV="${UCX_DEV:-enp1s0f1np1}"
+    # Error if no IB interface detected and not manually specified
+    echo "ERROR: No active InfiniBand/RoCE interface detected."
+    echo "Run 'ibdev2netdev' to check interface status."
+    exit 1
   fi
 fi
 
 # Auto-detect InfiniBand HCAs using ibdev2netdev (or use override)
 if [ -z "${NCCL_IB_HCA:-}" ]; then
-  IB_DEVICES=$(discover_all_roce_hcas)
+  IB_DEVICES=$(discover_all_ib_hcas)
   if [ -n "${IB_DEVICES}" ]; then
     NCCL_IB_HCA="${IB_DEVICES}"
   else
     # Fallback: use all IB devices from sysfs
     IB_DEVICES=$(ls -1 /sys/class/infiniband/ 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-    NCCL_IB_HCA="${IB_DEVICES:-mlx5_0,mlx5_1}"
+    NCCL_IB_HCA="${IB_DEVICES:-}"
+    if [ -z "${NCCL_IB_HCA}" ]; then
+      echo "ERROR: No InfiniBand HCAs detected."
+      echo "Run 'ibdev2netdev' or check /sys/class/infiniband/"
+      exit 1
+    fi
   fi
 fi
 
@@ -158,8 +137,8 @@ log "  Model:           ${MODEL}"
 log "  Tensor Parallel: ${TENSOR_PARALLEL}"
 log "  Ray Version:     ${RAY_VERSION}"
 log ""
-log "Network Configuration (auto-detected from RoCE):"
-log "  Primary RoCE IF: ${PRIMARY_ROCE_IF:-<not detected>}"
+log "Network Configuration (auto-detected from ibdev2netdev):"
+log "  Primary IB IF:   ${PRIMARY_IB_IF:-<not detected>}"
 log "  GLOO Interface:  ${GLOO_IF}"
 log "  TP Interface:    ${TP_IF}"
 log "  NCCL Interface:  ${NCCL_IF}"
@@ -176,14 +155,14 @@ log ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 1/8: Pulling Docker image"
+log "Step 1/9: Pulling Docker image"
 if ! docker pull "${IMAGE}"; then
   error "Failed to pull image ${IMAGE}"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 2/8: Cleaning old container"
+log "Step 2/9: Cleaning old container"
 if docker ps -a --format '{{.Names}}' | grep -qx "${NAME}"; then
   log "  Removing existing container: ${NAME}"
   docker rm -f "${NAME}" >/dev/null
@@ -191,19 +170,19 @@ fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 3/8: Starting head container"
+log "Step 3/9: Starting head container"
 
-# Build environment variable args for RoCE/NCCL configuration
-# These are passed into the container to ensure NCCL uses the 200 Gb link
+# Build environment variable args for IB/NCCL configuration
+# These are passed into the container to ensure NCCL uses the IB/RoCE link
 ENV_ARGS=(
   -e VLLM_HOST_IP="${HEAD_IP}"
-  # RoCE interface settings - all pointing to the 200 Gb ConnectX-7 NIC
+  # IB/RoCE interface settings for NCCL communication
   -e GLOO_SOCKET_IFNAME="${GLOO_IF}"
   -e TP_SOCKET_IFNAME="${TP_IF}"
   -e NCCL_SOCKET_IFNAME="${NCCL_IF}"
   -e UCX_NET_DEVICES="${UCX_DEV}"
   -e OMPI_MCA_btl_tcp_if_include="${OMPI_MCA_IF}"
-  # NCCL IB/RoCE settings
+  # NCCL InfiniBand settings
   -e NCCL_IB_DISABLE=0
   -e NCCL_IB_HCA="${NCCL_IB_HCA}"
   -e NCCL_NET_GDR_LEVEL=5
@@ -215,6 +194,7 @@ ENV_ARGS=(
   -e NVIDIA_DRIVER_CAPABILITIES=all
   # Ray settings
   -e RAY_memory_usage_threshold=0.998
+  -e RAY_GCS_SERVER_PORT=6380
   # HuggingFace cache
   -e HF_HOME=/root/.cache/huggingface
 )
@@ -245,7 +225,7 @@ log "  Container started successfully"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 4/8: Installing Ray ${RAY_VERSION}"
+log "Step 4/9: Installing Ray ${RAY_VERSION}"
 if ! docker exec "${NAME}" bash -lc "pip install -q -U 'ray==${RAY_VERSION}'"; then
   error "Failed to install Ray"
 fi
@@ -260,12 +240,51 @@ log "  Ray ${INSTALLED_RAY_VERSION} installed"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 5/8: Starting Ray head"
+log "Step 5/9: Pre-downloading model weights"
+log "  Model: ${MODEL}"
+log "  This may take a while for large models on first download..."
+
+# Build HF token arg if provided
+HF_TOKEN_ARG=""
+if [ -n "${HF_TOKEN}" ]; then
+  HF_TOKEN_ARG="--token ${HF_TOKEN}"
+fi
+
+# Download model with verification
+if ! docker exec "${NAME}" bash -lc "
+  export HF_HOME=/root/.cache/huggingface
+  echo '  Downloading model files (excluding original/* and metal/* to save space)...'
+  huggingface-cli download ${MODEL} ${HF_TOKEN_ARG} --exclude 'original/*' --exclude 'metal/*' 2>&1 | tail -5
+"; then
+  error "Failed to download model ${MODEL}"
+fi
+
+# Verify model was downloaded by checking for config.json
+if ! docker exec "${NAME}" bash -lc "
+  export HF_HOME=/root/.cache/huggingface
+  python3 -c \"
+from huggingface_hub import snapshot_download
+import os
+path = snapshot_download('${MODEL}', local_files_only=True)
+config_path = os.path.join(path, 'config.json')
+if not os.path.exists(config_path):
+    raise FileNotFoundError(f'Model config not found at {config_path}')
+print(f'  ✅ Model verified at: {path}')
+\"
+"; then
+  error "Model verification failed - config.json not found"
+fi
+
+log "  Model download complete and verified"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+log "Step 6/9: Starting Ray head"
 docker exec "${NAME}" bash -lc "
   ray stop --force 2>/dev/null || true
   ray start --head \
     --node-ip-address=${HEAD_IP} \
-    --port=6379 \
+    --port=6380 \
     --dashboard-host=0.0.0.0 \
     --dashboard-port=8265
 " >/dev/null
@@ -274,7 +293,7 @@ log "  Ray head started, waiting for readiness..."
 
 # Wait for Ray to become ready
 for i in {1..30}; do
-  if docker exec "${NAME}" bash -lc "ray status --address='127.0.0.1:6379' >/dev/null 2>&1"; then
+  if docker exec "${NAME}" bash -lc "ray status --address='127.0.0.1:6380' >/dev/null 2>&1"; then
     log "  ✅ Ray head is ready (${i}s)"
     break
   fi
@@ -286,19 +305,45 @@ done
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 6/8: Pre-downloading model"
-log "  This may take a while for large models..."
+log "Step 7/9: Waiting for worker nodes"
+log ""
+log "  ⚠️  IMPORTANT: Before proceeding, ensure all worker nodes have:"
+log "     1. Downloaded the model: export MODEL=${MODEL} && bash start_worker_vllm.sh"
+log "     2. Joined the Ray cluster"
+log ""
+log "  Checking Ray cluster status..."
 
-docker exec "${NAME}" bash -lc "
-  export HF_HOME=/root/.cache/huggingface
-  huggingface-cli download ${MODEL} --quiet 2>/dev/null || echo 'Download skipped or already cached'
-" >/dev/null
+# Show current cluster status
+docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | head -15" || true
 
-log "  Model download complete (or already cached)"
+CURRENT_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep -E '^ [0-9]+ node' | awk '{print \$1}'" 2>/dev/null || echo "1")
+CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
+
+log ""
+log "  Current cluster: ${CURRENT_NODES} node(s), ${CURRENT_GPUS} GPU(s)"
+
+if [ "${TENSOR_PARALLEL}" -gt "${CURRENT_GPUS:-1}" ]; then
+  log ""
+  log "  ⚠️  Warning: tensor-parallel-size (${TENSOR_PARALLEL}) > available GPUs (${CURRENT_GPUS})"
+  log "     Waiting 30 seconds for worker nodes to join..."
+  log "     (Press Ctrl+C to abort and add workers manually)"
+
+  for i in {1..30}; do
+    CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
+    if [ "${CURRENT_GPUS:-1}" -ge "${TENSOR_PARALLEL}" ]; then
+      log "  ✅ Sufficient GPUs available: ${CURRENT_GPUS}"
+      break
+    fi
+    if [ $i -eq 30 ]; then
+      log "  ⚠️  Proceeding with ${CURRENT_GPUS} GPU(s) - vLLM may fail if insufficient"
+    fi
+    sleep 1
+  done
+fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 7/8: Starting vLLM server"
+log "Step 8/9: Starting vLLM server"
 log ""
 
 # Kill any existing vLLM processes
@@ -307,9 +352,11 @@ docker exec "${NAME}" bash -lc "pkill -f 'vllm serve' 2>/dev/null || true" || tr
 log "  Starting vLLM in background (this launches the server process)..."
 
 # Start vLLM in background using nohup
+# Note: We do NOT set HF_HUB_OFFLINE=1 here because workers need to resolve the model name
+# The model should already be downloaded on all nodes via the pre-download step
 docker exec "${NAME}" bash -lc "
   export HF_HOME=/root/.cache/huggingface
-  export RAY_ADDRESS=127.0.0.1:6379
+  export RAY_ADDRESS=127.0.0.1:6380
   export PYTHONUNBUFFERED=1
   export VLLM_LOGGING_LEVEL=INFO
 
@@ -327,33 +374,113 @@ docker exec "${NAME}" bash -lc "
 " || true
 
 log "  vLLM server process started"
-log "  ⚠️  CUDA graph compilation may take 1-2 minutes on first startup"
-log "  Waiting for vLLM API to become ready..."
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "  🔄 MODEL LOADING IN PROGRESS"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log ""
+log "  This process typically takes 2-5 minutes depending on model size."
+log "  The server will:"
+log "    1. Load model weights into GPU memory"
+log "    2. Initialize tensor parallelism across GPUs"
+log "    3. Compile CUDA graphs for optimized inference"
+log ""
+log "  Progress updates will appear below..."
 log ""
 
-# Wait for vLLM to become ready (longer timeout for CUDA graph compilation)
+# Wait for vLLM to become ready with detailed progress feedback
 VLLM_READY=false
-for i in {1..180}; do
+MAX_WAIT=600  # 10 minutes max for very large models
+LAST_STATUS=""
+START_TIME=$(date +%s)
+
+for i in $(seq 1 $MAX_WAIT); do
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+  MINS=$((ELAPSED / 60))
+  SECS=$((ELAPSED % 60))
+
+  # Check if vLLM is ready
   if docker exec "${NAME}" bash -lc "curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1"; then
-    log "  ✅ vLLM server is ready and accepting requests (${i}s)"
+    echo ""
+    log ""
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "  ✅ MODEL LOADED SUCCESSFULLY!"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log ""
+    log "  vLLM is ready and accepting requests (loaded in ${MINS}m ${SECS}s)"
+    log ""
     VLLM_READY=true
     break
   fi
-  if [ $i -eq 180 ]; then
-    log "  ⚠️  vLLM not ready after 3 minutes - continuing anyway"
-    log "     Check logs: docker exec ${NAME} tail -50 /var/log/vllm.log"
+
+  # Check vLLM process status and extract progress from logs
+  VLLM_PID=$(docker exec "${NAME}" bash -lc "pgrep -f 'vllm serve' 2>/dev/null" || echo "")
+
+  if [ -z "${VLLM_PID}" ]; then
+    # vLLM process died - check logs for error
+    echo ""
+    log ""
+    log "  ❌ vLLM process exited unexpectedly!"
+    log ""
+    log "  Last 20 lines of vLLM log:"
+    docker exec "${NAME}" tail -20 /var/log/vllm.log 2>/dev/null || true
+    log ""
+    error "vLLM failed to start. Check logs: docker exec ${NAME} cat /var/log/vllm.log"
   fi
+
+  # Parse last meaningful log line to show progress
+  CURRENT_STATUS=$(docker exec "${NAME}" bash -lc "tail -50 /var/log/vllm.log 2>/dev/null | grep -E '(Loading|Loaded|weight|layer|graph|CUDA|tensor|parallel|shard|download|progress|INFO)' | tail -1 | sed 's/.*INFO/INFO/' | cut -c1-80" 2>/dev/null || echo "")
+
+  # Show spinner with elapsed time
+  SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  SPIN_CHAR="${SPINNER:$((i % 10)):1}"
+
+  # Update progress display
+  printf "\r  %s Loading model... [%dm %02ds elapsed]  " "${SPIN_CHAR}" "${MINS}" "${SECS}"
+
+  # Show status updates when they change (avoid flooding terminal)
+  if [ -n "${CURRENT_STATUS}" ] && [ "${CURRENT_STATUS}" != "${LAST_STATUS}" ]; then
+    echo ""
+    log "     ${CURRENT_STATUS}"
+    LAST_STATUS="${CURRENT_STATUS}"
+  fi
+
+  # Periodic milestone messages
+  if [ $((i % 60)) -eq 0 ]; then
+    echo ""
+    log "  ⏳ Still loading... (${MINS}m ${SECS}s) - this is normal for large models"
+  fi
+
   sleep 1
 done
+
+# Handle timeout
+if [ "${VLLM_READY}" != "true" ]; then
+  echo ""
+  log ""
+  log "  ⚠️  vLLM not ready after $((MAX_WAIT / 60)) minutes"
+  log ""
+  log "  This could mean:"
+  log "    - Model is still loading (very large models may need more time)"
+  log "    - An error occurred during loading"
+  log ""
+  log "  Check the logs for details:"
+  log "    docker exec ${NAME} tail -100 /var/log/vllm.log"
+  log ""
+  log "  You can also monitor GPU memory to see if loading is progressing:"
+  log "    watch -n 1 nvidia-smi"
+  log ""
+fi
 
 log ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 8/8: Running health checks"
+log "Step 9/9: Running health checks"
 
 # Check Ray status
-RAY_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6379 2>/dev/null | grep 'Healthy:' -A1 | tail -1 | awk '{print \$1}'" || echo "0")
+RAY_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'Healthy:' -A1 | tail -1 | awk '{print \$1}'" || echo "0")
 log "  Ray cluster: ${RAY_NODES} node(s) healthy"
 
 # Check vLLM models
@@ -362,10 +489,10 @@ log "  vLLM model: ${VLLM_MODEL}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Detect public-facing Ethernet IP for user access
-PUBLIC_IP=$(ip -o addr show | grep "inet " | grep -v "127.0.0.1" | grep -v "169.254" | grep -v "172.17" | awk '{print $4}' | cut -d'/' -f1 | head -1)
+# Detect public-facing IP for user access (exclude loopback and docker bridge)
+PUBLIC_IP=$(ip -o addr show | grep "inet " | grep -v "127.0.0.1" | grep -v "172.17" | awk '{print $4}' | cut -d'/' -f1 | head -1)
 if [ -z "${PUBLIC_IP}" ]; then
-  PUBLIC_IP="${HEAD_IP}"  # Fallback to InfiniBand IP if no Ethernet found
+  PUBLIC_IP="${HEAD_IP}"  # Fallback to IB IP if no other found
 fi
 
 echo ""
@@ -382,7 +509,7 @@ echo "  1. SSH to each worker node"
 echo "  2. Run: export HEAD_IP=${HEAD_IP}"
 echo "  3. Run: bash start_worker_vllm.sh"
 echo ""
-echo "  Note: Workers use InfiniBand IP (${HEAD_IP}) for cluster communication"
+echo "  Note: Workers use IB/RoCE IP (${HEAD_IP}) for cluster communication"
 echo "  Note: Worker IPs and network interfaces will be auto-detected!"
 echo ""
 echo "📊 Quick API Tests:"
@@ -399,7 +526,7 @@ echo "  # View vLLM logs"
 echo "  docker exec ${NAME} tail -f /var/log/vllm.log"
 echo ""
 echo "  # Ray cluster status (check for worker nodes)"
-echo "  docker exec ${NAME} ray status --address=127.0.0.1:6379"
+echo "  docker exec ${NAME} ray status --address=127.0.0.1:6380"
 echo ""
 echo "  # GPU utilization"
 echo "  watch -n 1 nvidia-smi"
