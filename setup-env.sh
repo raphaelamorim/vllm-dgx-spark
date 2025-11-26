@@ -123,10 +123,10 @@ if [[ "$NODE_TYPE" == "head" ]] || [[ "$NODE_TYPE" == "interactive" ]]; then
 
     # Optional model configuration
     echo -e "${BLUE}Optional Configuration (press Enter to use defaults):${NC}"
-    prompt_input "MODEL" "Model to serve" "meta-llama/Llama-3.3-70B-Instruct"
+    prompt_input "MODEL" "Model to serve" "openai/gpt-oss-120b"
     prompt_input "TENSOR_PARALLEL" "Number of GPUs (tensor parallel size)" "2"
-    prompt_input "MAX_MODEL_LEN" "Maximum context length (tokens)" "2048"
-    prompt_input "GPU_MEMORY_UTIL" "GPU memory utilization (0.0-1.0)" "0.70"
+    prompt_input "MAX_MODEL_LEN" "Maximum context length (tokens)" "8192"
+    prompt_input "GPU_MEMORY_UTIL" "GPU memory utilization (0.0-1.0)" "0.90"
     echo ""
 fi
 
