@@ -156,12 +156,9 @@ if [ -z "${WORKER_HOST}" ]; then
   echo "  ❌ WORKER_HOST is not set"
   echo ""
   echo "  For distributed inference, you must set WORKER_HOST to the worker's"
-  echo "  Ethernet IP address (for SSH access). Example:"
+  echo "  Ethernet IP address (for SSH access)."
   echo ""
-  echo "    export WORKER_HOST=192.168.7.111"
-  echo ""
-  echo "  Note: This is the standard Ethernet IP, not the InfiniBand IP."
-  echo "  The InfiniBand IP (HEAD_IP) is auto-detected from this node."
+  echo "  Run: source ./setup-env.sh --head"
   echo ""
   PREFLIGHT_FAILED=true
 else
@@ -303,6 +300,9 @@ echo ""
 if [ "$PREFLIGHT_FAILED" = true ]; then
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "❌ Pre-flight checks failed. Please fix the issues above and re-run."
+  echo ""
+  echo "To configure required variables, run:"
+  echo "  source ./setup-env.sh --head"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   exit 1
 fi
