@@ -1,316 +1,328 @@
-# Running vLLM on Two DGX Spark Units
+# vLLM on DGX Spark Cluster
 
-This repository contains scripts and documentation for deploying vLLM across two NVIDIA DGX Spark servers for distributed inference.
+Deploy [vLLM](https://github.com/vllm-project/vllm) on a dual-node NVIDIA DGX Spark cluster with InfiniBand RDMA for serving large language models.
 
-## Background
+## Features
 
-We initially attempted to follow NVIDIA's playbook at https://build.nvidia.com/spark/vllm/stacked-sparks, but encountered numerous version compatibility issues. The solution documented here takes a different approach: starting with the NVIDIA vLLM Docker container and building up the correct versions of dependencies to achieve a working distributed setup.
+- **Single-command deployment** - Start entire cluster from head node via SSH
+- **Auto-detection** of InfiniBand IPs, network interfaces, and HCA devices
+- **Generic scripts** that work on any DGX Spark pair
+- **15+ model presets** including Llama, Qwen, Mixtral, DeepSeek
+- **InfiniBand RDMA** for high-speed inter-node communication (200Gb/s)
+- **Comprehensive benchmarking** with multiple test profiles
 
-## Architecture
+## Cluster Architecture
 
-- **Head Node**: Runs Ray cluster head + vLLM server with model serving
-- **Worker Node(s)**: Join Ray cluster to provide additional GPU resources
-- **Communication**: Uses InfiniBand (200Gb) for high-speed inter-node communication
-- **Distribution**: Ray framework manages distributed inference across nodes
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DGX Spark 2-Node Cluster                     │
+│                                                                 │
+│  ┌──────────────────────┐      ┌──────────────────────┐        │
+│  │     HEAD NODE        │      │    WORKER NODE       │        │
+│  │    (Ray head)        │ SSH  │    (Ray worker)      │        │
+│  │                      │─────►│                      │        │
+│  │  GPU: 1x GB10        │◄────►│  GPU: 1x GB10        │        │
+│  │  (Blackwell, sm100)  │ IB   │  (Blackwell, sm100)  │        │
+│  │                      │200Gb │                      │        │
+│  │  /raid/hf-cache      │      │  /raid/hf-cache      │        │
+│  │  Port: 8000 (API)    │      │                      │        │
+│  └──────────────────────┘      └──────────────────────┘        │
+│                                                                 │
+│  Tensor Parallel (TP=2): Model split across both GPUs          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Hardware Requirements
+
+- **Nodes:** 2x DGX Spark systems
+- **GPUs:** 1x NVIDIA GB10 (Grace Blackwell, sm100) per node, ~120GB VRAM each
+- **Network:** 200Gb/s InfiniBand RoCE between nodes
+- **Storage:** Shared model cache at `/raid/hf-cache` (or configure in `config.env`)
+- **SSH:** Passwordless SSH from head to worker node(s)
 
 ## Prerequisites
 
-### On Both Head and Worker Nodes
+Complete these steps on **BOTH** servers before running `start_cluster.sh`:
 
-1. **NVIDIA GPU Drivers**
-   - NVIDIA drivers installed and working
-   - Verify: `nvidia-smi`
+### 1. NVIDIA GPU Drivers
 
-2. **Docker with NVIDIA Container Runtime**
-   - Docker installed
-   - NVIDIA Container Runtime configured
-   - Verify: `docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu20.04 nvidia-smi`
+Ensure NVIDIA drivers are installed and working:
+```bash
+nvidia-smi
+```
+You should see your GPU listed with driver version.
 
-3. **Network Configuration**
-   - **⚠️  CRITICAL:** InfiniBand (QSFP) interfaces must be configured and operational
-   - InfiniBand interfaces: enp1s0f1np1, enP2p1s0f1np1 (DGX Spark specific)
-   - InfiniBand IPs are typically in the 169.254.x.x range
-   - Verify InfiniBand: `ibstatus` or `ip addr show | grep 169.254`
-   - Both nodes can reach each other via InfiniBand IPs
-   - Test IB connectivity: `ping <infiniband-ip-of-other-node>`
-   - Firewall allows ports: 6379 (Ray), 8265 (Ray Dashboard), 8000 (vLLM API)
-   - **Performance Note:** Using standard Ethernet IPs instead of InfiniBand will result in 10-20x slower performance
-   - **Need help with InfiniBand setup?** See NVIDIA's guide: https://build.nvidia.com/spark/nccl/stacked-sparks
+### 2. Docker with NVIDIA Container Runtime
 
-4. **Storage**
-   - Sufficient disk space for models (70B models need ~140GB)
-   - Default cache location: `/raid/hf-cache` (automatically created if needed)
-   - To use a different location, set `HF_CACHE` environment variable before running scripts
-   - **⚠️ IMPORTANT:** Fix HuggingFace cache permissions on both nodes (see step below)
+Docker must be installed with NVIDIA Container Runtime configured:
+```bash
+# Verify Docker works with GPU access
+docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu20.04 nvidia-smi
+```
+If this fails, install/configure the NVIDIA Container Toolkit.
 
-5. **SSH Access** (for orchestrated multi-node setup)
-   - SSH keys configured for passwordless login to worker nodes
-   - The head node script uses SSH to:
-     1. Sync model files to workers (via rsync)
-     2. Start the worker script remotely
-   - Set up passwordless SSH to the worker's **Ethernet IP**:
-     ```bash
-     ssh-copy-id <worker-ethernet-ip>  # e.g., 192.168.7.111
-     ```
-   - Test: `ssh <worker-ethernet-ip> hostname`
+### 3. InfiniBand Network Configuration
 
-6. **HuggingFace Cache Permissions**
-
-   Docker containers run as root and create files owned by root in the HF cache. This causes permission issues when syncing models between nodes. **Run this once on both nodes:**
-
-   ```bash
-   # On head node
-   sudo chown -R $USER /raid/hf-cache
-
-   # On worker node (replace with your worker IP)
-   ssh <worker-ip> "sudo chown -R \$USER /raid/hf-cache"
-   ```
-
-   Alternatively, run `source ./setup-env.sh` which will detect and offer to fix permission issues automatically.
-
-### Environment Configuration
-
-The scripts now **auto-detect** most network configuration automatically using NVIDIA's `ibdev2netdev` tool. You only need to set a few variables:
-
-#### Required Environment Variables
-
-**On Head Node:**
+**CRITICAL:** InfiniBand (QSFP) interfaces must be configured and operational for multi-node performance.
 
 ```bash
-# Required - only if you want to serve gated models
-export HF_TOKEN="hf_your_token_here"        # HuggingFace token for gated models like Llama
+# Check InfiniBand status
+ibstatus
 
-# Optional overrides (all have sensible defaults or auto-detection)
-export MODEL="meta-llama/Llama-3.3-70B-Instruct"  # Default model
-export TENSOR_PARALLEL="2"                         # Number of GPUs across cluster
-export MAX_MODEL_LEN="2048"                       # Context window size
-export GPU_MEMORY_UTIL="0.70"                     # GPU memory utilization
+# Find InfiniBand interfaces (typically enp1s0f1np1, enP2p1s0f1np1 on DGX Spark)
+ip addr show | grep 169.254
+
+# Verify both nodes can reach each other via InfiniBand
+ping <infiniband-ip-of-other-node>
 ```
 
-**On Worker Node:**
+InfiniBand IPs are typically in the `169.254.x.x` range.
+
+**Performance Warning:** Using standard Ethernet IPs instead of InfiniBand will result in **10-20x slower performance**.
+
+Need help with InfiniBand setup? See NVIDIA's guide: https://build.nvidia.com/spark/nccl/stacked-sparks
+
+### 4. Firewall Configuration
+
+Ensure the following ports are open between both nodes:
+- **6379** - Ray GCS
+- **8265** - Ray Dashboard
+- **8000** - vLLM API
+
+### 5. Hugging Face Authentication (for gated models)
+
+Some models (Llama, Gemma, etc.) require Hugging Face authorization:
 
 ```bash
-# Required - must match the head node's InfiniBand IP
-export HEAD_IP="169.254.x.x"             # Head node InfiniBand IP
+# Install the Hugging Face CLI (run on both nodes)
+pip install huggingface_hub
 
-# Everything else is auto-detected!
+# Login to Hugging Face (run on both nodes)
+huggingface-cli login
+# Enter your token when prompted
+
+# Accept model licenses
+# Visit the model page on huggingface.co and accept the license agreement
+# Example: https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct
 ```
 
-#### What Gets Auto-Detected
+Alternatively, set `HF_TOKEN` in your `config.local.env`:
+```bash
+HF_TOKEN="hf_your_token_here"
+```
 
-The scripts automatically detect and configure:
-- ✅ **HEAD_IP**: Auto-detected from active InfiniBand interface (head node only)
-- ✅ **WORKER_IP**: Auto-detected from active InfiniBand interface
-- ✅ **Network Interfaces**: GLOO_IF, TP_IF, NCCL_IF, UCX_DEV
-- ✅ **NCCL_IB_HCA**: InfiniBand HCAs (Host Channel Adapters)
+## Quick Start
 
-The scripts use NVIDIA's recommended `ibdev2netdev` utility to find active InfiniBand interfaces and automatically configure all network settings.
-
-#### Manual Override (Optional)
-
-If you need to override auto-detection, you can still set these manually:
+### 1. Clone and Setup
 
 ```bash
-export HEAD_IP="169.254.x.x"             # Override head IP
-export WORKER_IP="169.254.y.y"            # Override worker IP
-export GLOO_IF="enp1s0f1np1"               # Override GLOO interface
-export TP_IF="enp1s0f1np1"                 # Override TP interface
-export NCCL_IF="enp1s0f1np1"               # Override NCCL interface
-export UCX_DEV="enP2p1s0f1np1"             # Override UCX device
-export NCCL_IB_HCA="rocep1s0f1,roceP2p1s0f1"  # Override IB HCAs
+git clone <this-repo>
+cd vllm-dgx-spark
 ```
 
-### Getting Your HuggingFace Token
+### 2. Setup SSH (one-time)
 
-1. Create account at https://huggingface.co/
-2. Go to Settings → Access Tokens
-3. Create a new token with read permissions
-4. Accept terms for gated models (e.g., https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
-
-## Auto-Detection Features
-
-Both scripts now include intelligent auto-detection using NVIDIA's `ibdev2netdev` utility:
-
-### What Gets Auto-Detected
-
-1. **InfiniBand IP Addresses**
-   - Head node: Automatically detects HEAD_IP from active IB interface
-   - Worker node: Automatically detects WORKER_IP from active IB interface
-   - Prioritizes `enp1*` interfaces over `enP2p*` per NVIDIA best practices
-
-2. **Network Interfaces**
-   - GLOO_SOCKET_IFNAME (communication backend)
-   - TP_SOCKET_IFNAME (tensor parallelism)
-   - NCCL_SOCKET_IFNAME (collective communications)
-   - UCX_NET_DEVICES (unified communication)
-
-3. **InfiniBand HCAs**
-   - Detects only active (Up) InfiniBand devices
-   - Configures NCCL_IB_HCA with comma-separated list
-   - Example: `rocep1s0f1,roceP2p1s0f1`
-
-### How It Works
-
-The scripts use `ibdev2netdev` to query InfiniBand device status:
+Ensure passwordless SSH from head to worker:
 ```bash
-$ ibdev2netdev
-rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)
-roceP2p1s0f1 port 1 ==> enP2p1s0f1np1 (Up)
+# On head node, generate key if needed:
+ssh-keygen -t ed25519  # Press enter for defaults
+
+# Copy to worker (replace with your worker's InfiniBand IP):
+ssh-copy-id <username>@<worker-ib-ip>
+
+# Test connection:
+ssh <username>@<worker-ib-ip> "hostname"
 ```
 
-From this output, the scripts automatically:
-- Extract active network interfaces
-- Determine corresponding IP addresses
-- Configure all NCCL/UCX environment variables
-- Set up optimal InfiniBand communication
+### 3. Configure Environment
 
-### Fallback Behavior
+**Option A: Interactive setup (recommended)**
+```bash
+source ./setup-env.sh
+```
 
-If `ibdev2netdev` is not available or detection fails:
-- Uses sensible DGX Spark defaults
-- Logs warnings for manual verification
-- You can still override with environment variables
+**Option B: Edit config file**
+```bash
+cp config.env config.local.env
+vim config.local.env
+
+# Set at minimum:
+# WORKER_IPS="<worker-infiniband-ip>"
+# WORKER_USER="<ssh-username>"
+```
+
+### 4. Start the Cluster
+
+From the **head node**, run:
+```bash
+./start_cluster.sh
+```
+
+This single command will:
+1. Pull the Docker image on both nodes
+2. Download the model (with rsync to worker)
+3. SSH to worker(s) and start Ray worker containers
+4. Start Ray head and vLLM server
+5. Wait for the cluster to become ready (~2-5 minutes)
+
+### 5. Verify the Cluster
+
+```bash
+# Check health
+curl http://localhost:8000/health
+
+# List models
+curl http://localhost:8000/v1/models
+
+# Test inference
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":50}'
+```
+
+### 6. Run Benchmarks
+
+```bash
+# Single-request latency test
+./benchmark_current.sh --single
+
+# Quick benchmark (20 prompts)
+./benchmark_current.sh --quick
+
+# Full benchmark (100 prompts)
+./benchmark_current.sh
+```
+
+### 7. Stop the Cluster
+
+```bash
+./stop_cluster.sh
+```
 
 ## Scripts Overview
 
-### Deployment Scripts
+| Script | Description |
+|--------|-------------|
+| `setup-env.sh` | Interactive environment setup (source this!) |
+| `config.env` | Configuration template |
+| `start_cluster.sh` | **Main script** - starts head + workers via SSH |
+| `stop_cluster.sh` | Stops containers on head + workers |
+| `switch_model.sh` | Switch between different models |
+| `benchmark_current.sh` | Benchmark current model |
+| `benchmark_all.sh` | Benchmark all models and create comparison matrix |
+| `checkout_setup.sh` | System diagnostics (InfiniBand, NCCL, GPU) |
 
-#### 1. `start_head_vllm.sh` - Head Node Setup
+## Configuration
 
-The primary script for setting up the head node with vLLM distributed inference.
+Key settings in `config.env` or `config.local.env`:
 
-**Features:**
-- **Auto-detects** InfiniBand IP and network interfaces using `ibdev2netdev`
-- Pulls NVIDIA vLLM Docker image (nvcr.io/nvidia/vllm:25.11-py3)
-- Starts container with InfiniBand support
-- Installs Ray 2.51.0 (for version compatibility)
-- Starts Ray head node
-- Downloads the specified model
-- Launches vLLM server with distributed backend
-- **Enables InfiniBand/RoCE** with proper NCCL configuration
-
-**Configuration (optional overrides):**
-- `HF_TOKEN`: HuggingFace token for gated models
-- `MODEL`: Which model to serve (default: Llama-3.3-70B-Instruct)
-- `TENSOR_PARALLEL`: Number of GPUs across cluster (default: 2)
-- `MAX_MODEL_LEN`: Context window size (default: 2048)
-- `GPU_MEMORY_UTIL`: GPU memory utilization factor (default: 0.70)
-
-**Usage:**
 ```bash
-# Basic usage with auto-detection
-./start_head_vllm.sh
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ Required for Multi-Node                                         │
+# └─────────────────────────────────────────────────────────────────┘
+WORKER_IPS="<worker-ib-ip>"        # Worker InfiniBand IP(s), space-separated
+WORKER_USER="<username>"           # SSH username for workers
 
-# With custom model
-export MODEL="meta-llama/Llama-3.1-405B-Instruct"
-export TENSOR_PARALLEL=4
-./start_head_vllm.sh
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ Model Settings                                                  │
+# └─────────────────────────────────────────────────────────────────┘
+MODEL="openai/gpt-oss-120b"        # Model to serve
+TENSOR_PARALLEL="2"                # Total GPUs (1 per node × 2 nodes)
+GPU_MEMORY_UTIL="0.90"             # GPU memory utilization for KV cache
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ vLLM Options                                                    │
+# └─────────────────────────────────────────────────────────────────┘
+MAX_MODEL_LEN="8192"               # Max context length
+SWAP_SPACE="16"                    # Swap space in GB
+ENABLE_EXPERT_PARALLEL="true"      # For MoE models
+TRUST_REMOTE_CODE="false"          # For custom model code
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ Optional                                                        │
+# └─────────────────────────────────────────────────────────────────┘
+HF_TOKEN="hf_xxx"                  # For gated models (Llama, etc.)
+VLLM_IMAGE="nvcr.io/nvidia/vllm:25.11-py3"  # Docker image
 ```
 
-#### 2. `start_worker_vllm.sh` - Worker Node Setup
+### Finding Worker InfiniBand IP
 
-Sets up worker nodes to join the Ray cluster and provide additional GPU resources.
-
-**Features:**
-- **Auto-detects** worker IP and network interfaces
-- Pulls the same Docker image as head
-- Tests connectivity to head node before setup
-- Starts container with InfiniBand support
-- Installs matching Ray version
-- Joins Ray cluster at head IP
-- **Enables InfiniBand/RoCE** with proper NCCL configuration
-
-**Required configuration:**
-- `HEAD_IP`: Head node's InfiniBand IP (must be set manually)
-
-**Usage:**
+On the **worker node**, run:
 ```bash
-# Basic usage
-export HEAD_IP=169.254.103.56
-./start_worker_vllm.sh
+# Find InfiniBand interface name
+ibdev2netdev
+
+# Example output: mlx5_0 port 1 ==> enp1s0f1np1 (Up)
+
+# Get IP address for that interface
+ip addr show enp1s0f1np1 | grep "inet "
+
+# Example output: inet 169.254.x.x/16 ...
 ```
 
-#### 3. `test_vllm_cluster.sh` - Cluster Testing
+## Switching Models
 
-Comprehensive test suite for validating your distributed vLLM cluster.
+Use `switch_model.sh` to easily switch between models:
 
-**Tests performed:**
-- Container health checks
-- Ray cluster connectivity
-- GPU visibility and allocation
-- vLLM API endpoint availability
-- Inference functionality with sample prompts
-- Response time and throughput measurements
-
-**Usage:**
 ```bash
-# Run all tests
-./test_vllm_cluster.sh
+# List available models
+./switch_model.sh --list
 
-# Check exit code
-echo $?  # 0 = all tests passed
+# Interactive selection
+./switch_model.sh
+
+# Direct selection (by number)
+./switch_model.sh 3  # Switch to Qwen2.5-7B
+
+# Update config only (don't restart)
+./switch_model.sh -s 5
+
+# Download model only
+./switch_model.sh -d 1
+
+# Download and sync to worker
+./switch_model.sh -r 1
 ```
 
-**Output:**
-- Detailed test results for each component
-- Summary of cluster health
-- Performance metrics
-- Recommendations for issues found
+## Supported Models
 
-#### 4. `monitor_gpu_during_inference.sh` - GPU Utilization Monitor
+All models run across both DGX Spark nodes (TP=2) for maximum performance.
 
-Real-time GPU utilization monitoring during inference to identify performance bottlenecks (compute-bound vs network-bound).
+| # | Model | Size | Notes |
+|---|-------|------|-------|
+| 1 | `openai/gpt-oss-120b` | ~80GB+ | Default, MoE, reasoning model |
+| 2 | `openai/gpt-oss-20b` | ~16-20GB | MoE, fast |
+| 3 | `Qwen/Qwen2.5-7B-Instruct` | ~7GB | Very fast |
+| 4 | `Qwen/Qwen2.5-14B-Instruct` | ~14GB | Fast |
+| 5 | `Qwen/Qwen2.5-32B-Instruct` | ~30GB | Strong mid-size |
+| 6 | `Qwen/Qwen2.5-72B-Instruct` | ~70GB | High quality |
+| 7 | `mistralai/Mistral-7B-Instruct-v0.3` | ~7GB | Very fast |
+| 8 | `mistralai/Mistral-Nemo-Instruct-2407` | ~12GB | 128k context |
+| 9 | `mistralai/Mixtral-8x7B-Instruct-v0.1` | ~45GB | MoE, fast |
+| 10 | `meta-llama/Llama-3.1-8B-Instruct` | ~8GB | Very fast (needs HF token) |
+| 11 | `meta-llama/Llama-3.1-70B-Instruct` | ~65GB | High quality (needs HF token) |
+| 12 | `microsoft/phi-4` | ~14-16GB | Small but smart |
+| 13 | `google/gemma-2-27b-it` | ~24-28GB | Strong mid-size (needs HF token) |
+| 14 | `deepseek-ai/DeepSeek-V2-Lite-Chat` | ~12-16GB | MoE, reasoning tuned |
 
-**Features:**
-- Monitors GPU utilization, memory, and power draw during inference
-- Runs sample inference request while collecting metrics
-- Calculates average GPU utilization
-- Determines if bottleneck is compute or network
-- Saves detailed logs for analysis
+## Benchmark Profiles
 
-**Usage:**
+The `benchmark_current.sh` script supports multiple options:
+
 ```bash
-# Monitor GPU during inference
-./monitor_gpu_during_inference.sh [vllm_url]
-
-# Default URL is http://localhost:8000
-./monitor_gpu_during_inference.sh
-```
-
-**Output:**
-- Real-time GPU metrics (sampled every 0.5s)
-- Inference throughput (tokens/second)
-- Average GPU utilization analysis
-- Bottleneck identification (compute-bound vs network-bound)
-- Detailed log file saved
-
-#### 5. `benchmark_current_vllm.sh` - Performance Benchmarking with vllm bench serve
-
-Uses the official `vllm bench serve` tool for consistent, reproducible benchmarks. Based on eugr's benchmarking methodology from the NVIDIA forums.
-
-**Features:**
-- Uses official vLLM benchmarking tool for accurate results
-- ShareGPT dataset for realistic workload distribution (auto-downloads if missing)
-- Measures Output token throughput, Peak throughput, TTFT, TPOT
-- Single-request mode for latency testing
-- Comparison against reference InfiniBand vs Ethernet performance
-
-**Usage:**
-```bash
-# Full benchmark (100 prompts from ShareGPT dataset)
-./benchmark_current_vllm.sh
-
 # Single-request latency test
-./benchmark_current_vllm.sh --single
+./benchmark_current.sh --single
 
 # Quick benchmark (20 prompts)
-./benchmark_current_vllm.sh --quick
+./benchmark_current.sh --quick
 
-# Custom prompts/concurrency with JSON output
-./benchmark_current_vllm.sh -n 50 -c 50 -o results.json
+# Full benchmark (100 prompts, default)
+./benchmark_current.sh
+
+# Custom options
+./benchmark_current.sh -n 50 -c 50 -o results.json
 ```
 
-**Options:**
 | Option | Description |
 |--------|-------------|
 | `-u, --url URL` | vLLM API URL (default: auto-detect) |
@@ -320,639 +332,223 @@ Uses the official `vllm bench serve` tool for consistent, reproducible benchmark
 | `-s, --single` | Run single-request benchmark only |
 | `-q, --quick` | Quick mode: 20 prompts, lower concurrency |
 | `-o, --output FILE` | Output results to JSON file |
-| `-h, --help` | Show help message |
 
-**Performance Reference (Qwen3-30B-A3B, dual Spark):**
-| Configuration | Ethernet | InfiniBand | Improvement |
-|---------------|----------|------------|-------------|
-| Tensor Parallel (tp=2) | 56 t/s | **76 t/s** | +36% |
-| Batch (100 prompts) | ~410 t/s | ~707 t/s | +72% |
+### Benchmark All Models
 
-#### 6. `diagnose_nccl.sh` - NCCL/InfiniBand Diagnostic
-
-Verifies that NCCL is properly configured to use InfiniBand/RoCE instead of falling back to standard Ethernet. Using IB/RoCE can provide 30-40% better performance.
-
-**What it checks:**
-- InfiniBand/RoCE device detection via ibdev2netdev
-- RDMA/Verbs libraries (libibverbs, librdmacm)
-- NCCL environment variables
-- Network interface configuration
-- NCCL transport selection (IB vs Socket)
-- vLLM log analysis for NCCL issues
-
-**Usage:**
-```bash
-# Check host system
-./diagnose_nccl.sh
-
-# Check inside ray-head container (recommended)
-./diagnose_nccl.sh --container
-```
-
-**Example output:**
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NCCL/InfiniBand Diagnostic Report
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-▶ 1. InfiniBand/RoCE Device Detection
-✓ ibdev2netdev command available
-✓ InfiniBand/RoCE devices found:
-    mlx5_0 port 1 ==> enp1s0f0np0 (Up)
-    mlx5_1 port 1 ==> enp1s0f1np1 (Up)
-✓ 2 active IB/RoCE device(s)
-
-▶ 2. RDMA/Verbs Libraries
-✓ libibverbs found
-✓ librdmacm found
-...
-```
-
-### Diagnostic Scripts
-
-#### 7. `vllm_system_checkout.sh` - Comprehensive System Diagnostics
-
-A complete diagnostic tool that collects all critical system information for troubleshooting performance and configuration issues.
-
-**What it checks:**
-- System information (OS, kernel, memory, CPU)
-- GPU configuration on both local and remote nodes
-- Docker container status and configuration
-- Ray cluster status and resources
-- Network configuration (Ethernet and InfiniBand)
-- NCCL configuration and environment variables
-- vLLM process information
-- Docker logs and system resource usage
-
-**Features:**
-- Generates timestamped diagnostic reports
-- Supports multi-node diagnostics via SSH
-- Non-destructive (read-only operations)
-- Detailed summary with key findings
-- Colored output for easy reading
-
-**Usage:**
-```bash
-# Basic usage (local node only)
-./vllm_system_checkout.sh
-
-# Full multi-node diagnostics (recommended)
-export SECOND_DGX_HOST=spark-30e0
-./vllm_system_checkout.sh
-
-# Output saved to: vllm_diagnostic_report_YYYYMMDD_HHMMSS.log
-```
-
-**Use cases:**
-- Troubleshooting performance issues (<5 tokens/s)
-- Verifying InfiniBand/RoCE is being used
-- Checking if both nodes are properly connected
-- Validating NCCL network configuration
-- Debugging GPU utilization problems
-- Collecting information for support requests
-
-#### 7. `check_infiniband.sh` - InfiniBand/RoCE Diagnostics
-
-A focused diagnostic tool specifically for InfiniBand and RoCE network validation.
-
-**What it checks:**
-- InfiniBand hardware detection (Mellanox HCAs)
-- InfiniBand tools installation (ibstat, ibstatus)
-- InfiniBand kernel modules
-- InfiniBand devices (/dev/infiniband)
-- Network interfaces (ib0, ib1, or RoCE interfaces)
-- InfiniBand port status and state
-- NCCL environment variables for InfiniBand
-- NCCL configuration in Ray containers
-
-**Features:**
-- Quick health check (runs in seconds)
-- Clear pass/fail indicators
-- Recommendations for fixing issues
-- Shows recommended NCCL configuration
-
-**Usage:**
-```bash
-# Run InfiniBand diagnostics
-./check_infiniband.sh
-```
-
-**What to look for:**
-- ✅ `NET/IB` in NCCL logs = InfiniBand/RoCE is working
-- ❌ `NET/Socket` in NCCL logs = Falling back to Ethernet (slow!)
-
-**Common issues detected:**
-- InfiniBand tools not installed
-- Network interfaces not configured
-- NCCL not configured to use InfiniBand
-- InfiniBand subnet manager not running
-
-### Helper Scripts
-
-#### 8. `deploy_to_workers.sh` - Automated Worker Deployment
-
-Utility script for deploying the repository to multiple worker nodes via SSH.
-
-**Features:**
-- Uses rsync for efficient file transfer
-- Preserves file permissions and timestamps
-- Excludes unnecessary files (.git, logs, cache)
-
-**Usage:**
-```bash
-# Edit the script to set your worker hostnames
-# Then run:
-./deploy_to_workers.sh
-```
-
-#### 9. `setup-env.sh` - Environment Setup
-
-Sets up the common environment configuration used by other scripts.
-
-**Use cases:**
-- Source this in your shell for manual operations
-- Used internally by deployment scripts
-
-**Usage:**
-```bash
-# Source the environment
-source ./setup-env.sh
-
-# Now you have all variables set
-echo $HEAD_IP
-```
-
-### Utility Scripts (Legacy)
-
-The following scripts are from the parent directory and are included for reference:
-
-- `qwen-235b-fp4-vllm.sh` - Example for running Qwen 235B with FP4 quantization
-- `qwen-235b-vllm-optimized.sh` - Optimized configuration for Qwen 235B
-- `start_worker_vllm_node.sh` - Simplified worker node startup
-
-## Important: InfiniBand Network Configuration
-
-**Before deploying, verify your InfiniBand network is working:**
-
-### Finding Your InfiniBand IPs
-
-On each DGX Spark node, run:
-```bash
-ip addr show | grep 169.254
-```
-
-Expected output should show interfaces with 169.254.x.x addresses:
-```
-inet 169.254.x.x/16 brd 169.254.255.255 scope global enp1s0f1np1
-```
-
-### Verifying InfiniBand Status
-
-Check InfiniBand hardware status:
-```bash
-ibstatus
-```
-
-Expected output should show active ports:
-```
-Infiniband device 'mlx5_0' port 1 status:
-    state: 4: ACTIVE
-    physical state: 5: LinkUp
-```
-
-### Testing Inter-Node Connectivity
-
-From head node, ping worker's InfiniBand IP:
-```bash
-ping 169.254.y.y  # Replace with your worker's IB IP
-```
-
-From worker node, ping head's InfiniBand IP:
-```bash
-ping 169.254.x.x  # Replace with your head's IB IP
-```
-
-**If InfiniBand is not working, DO NOT proceed.** The cluster will run but performance will be degraded by 10-20x.
-
-Common InfiniBand issues:
-- Cables not properly seated in QSFP ports
-- InfiniBand subnet manager not running
-- Incorrect network interface names
-
-**Need help configuring InfiniBand between two DGX Spark units?**
-See NVIDIA's NCCL over InfiniBand guide: https://build.nvidia.com/spark/nccl/stacked-sparks
-
-## Deployment Steps
-
-### Step 1: Prepare Head Node
-
-1. SSH into the head node and clone this repository:
-```bash
-git clone https://github.com/mark-ramsey-ri/vllm-dgx-spark.git
-cd vllm-dgx-spark
-```
-
-2. (Optional) Set your HuggingFace token if using gated models:
-```bash
-export HF_TOKEN="hf_your_token_here"
-```
-
-3. Run the head node setup - **network configuration is auto-detected**:
-```bash
-bash start_head_vllm.sh
-```
-
-The script will automatically:
-- ✅ Detect your InfiniBand IP address
-- ✅ Configure all network interfaces
-- ✅ Set up NCCL for optimal InfiniBand performance
-
-4. Wait for completion (may take 10-15 minutes for model download)
-
-5. Verify the head is ready:
-```bash
-docker exec ray-head ray status --address=127.0.0.1:6379
-```
-
-Expected output: Should show "Healthy: 1 node"
-
-**Note:** The script output will show all auto-detected values. Review them to ensure they're correct.
-
-### Step 2: Prepare Worker Node(s)
-
-**Option A: Run directly on worker**
-
-1. SSH into the worker node and clone the repository:
-```bash
-git clone https://github.com/mark-ramsey-ri/vllm-dgx-spark.git
-cd vllm-dgx-spark
-```
-
-2. Set the head node IP (this is the only required variable):
-```bash
-export HEAD_IP="169.254.x.x"  # Use the IP shown in head node output
-```
-
-**Note:** To find the head node IP, check the head node script output or run on head: `ip addr show | grep 169.254`
-
-3. Run the worker setup - **everything else is auto-detected**:
-```bash
-bash start_worker_vllm.sh
-```
-
-The script will automatically:
-- ✅ Detect worker's InfiniBand IP address
-- ✅ Configure all network interfaces
-- ✅ Set up NCCL for optimal InfiniBand performance
-
-**Option B: Deploy from head node**
-
-1. SSH to each worker and run with HEAD_IP:
-```bash
-ssh worker-hostname "export HEAD_IP=169.254.x.x && cd vllm-dgx-spark && bash start_worker_vllm.sh"
-```
-
-That's it! The worker will auto-detect its own configuration.
-
-### Step 3: Verify Cluster
-
-From the head node:
+Use `benchmark_all.sh` to automatically benchmark multiple models and create a comparison matrix:
 
 ```bash
-# Check Ray cluster
-docker exec ray-head ray status --address=127.0.0.1:6379
+# Benchmark all models (takes several hours)
+./benchmark_all.sh
+
+# Only single-node models (faster)
+./benchmark_all.sh --single-node
+
+# Skip models requiring HF token
+./benchmark_all.sh --skip-token
 ```
 
-Expected output: Should show "Healthy: 2 nodes" (or more if multiple workers)
+## API Endpoints
+
+Once running, the API is available on the head node:
+
+| Endpoint | Description |
+|----------|-------------|
+| `http://<head-ip>:8000/health` | Health check |
+| `http://<head-ip>:8000/v1/models` | List models |
+| `http://<head-ip>:8000/v1/chat/completions` | Chat API (OpenAI compatible) |
+| `http://<head-ip>:8000/v1/completions` | Completions API |
+
+### Example: Chat Completion
 
 ```bash
-# Run comprehensive tests
-bash test_vllm_cluster.sh
-```
-
-### Step 4: Test Inference
-
-```bash
-# List available models
-curl http://<HEAD_IP>:8000/v1/models
-
-# Simple completion test
-curl http://<HEAD_IP>:8000/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "meta-llama/Llama-3.3-70B-Instruct",
-    "messages": [{"role": "user", "content": "Hello! How are you?"}],
-    "max_tokens": 100
+    "model": "openai/gpt-oss-120b",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Explain quantum computing briefly."}
+    ],
+    "max_tokens": 200,
+    "temperature": 0.7
   }'
 ```
 
-## Monitoring
+### Example: Python Client
 
-### Ray Dashboard
-- URL: `http://<HEAD_IP>:8265`
-- View cluster nodes, resource usage, and task execution
+```python
+from openai import OpenAI
 
-### vLLM Logs
-```bash
-# On head node
-docker exec ray-head tail -f /var/log/vllm.log
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed"
+)
+
+response = client.chat.completions.create(
+    model="openai/gpt-oss-120b",
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=100
+)
+print(response.choices[0].message.content)
 ```
-
-### GPU Monitoring
-```bash
-# Real-time GPU usage
-watch -n 1 nvidia-smi
-
-# Detailed GPU metrics
-nvidia-smi dmon -s pucvmet
-```
-
-### Ray Status
-```bash
-# Check cluster health
-docker exec ray-head ray status --address=127.0.0.1:6379
-
-# On worker (shows connection status)
-docker exec ray-worker-<hostname> ray status --address=<HEAD_IP>:6379
-```
-
-## Configuration Details
-
-### Network Interfaces (Auto-Detected)
-
-The scripts automatically detect and configure InfiniBand interfaces using `ibdev2netdev`:
-- `GLOO_SOCKET_IFNAME` - Gloo communication backend (auto-detected)
-- `TP_SOCKET_IFNAME` - Tensor parallelism communication (auto-detected)
-- `NCCL_SOCKET_IFNAME` - NVIDIA Collective Communications (auto-detected)
-- `UCX_NET_DEVICES` - Unified Communication X (auto-detected)
-- `NCCL_IB_HCA` - InfiniBand HCAs (auto-detected from active devices)
-
-The scripts prioritize `enp1*` interfaces over `enP2p*` interfaces per NVIDIA recommendations.
-
-If you need to override auto-detection, set the environment variables before running the scripts.
-
-### Docker Configuration
-
-Key Docker parameters:
-- `--network host`: Direct host networking for Ray
-- `--gpus all`: Access to all GPUs
-- `--shm-size=16g`: Large shared memory for model loading
-- `--device=/dev/infiniband`: InfiniBand device access
-- `--ulimit memlock=-1`: Unlimited locked memory for IB
-- `--restart unless-stopped`: Auto-restart on failure
-
-### Model Configuration
-
-Adjust in `start_head_vllm.sh`:
-
-```bash
-MODEL="meta-llama/Llama-3.3-70B-Instruct"  # Model to serve
-TENSOR_PARALLEL="2"                         # GPUs across cluster
-MAX_MODEL_LEN="2048"                        # Context window
-GPU_MEMORY_UTIL="0.70"                      # Memory utilization (70%)
-```
-
-For larger models or different configurations:
-- Increase `TENSOR_PARALLEL` if using more GPUs
-- Adjust `MAX_MODEL_LEN` for longer contexts (uses more memory)
-- Tune `GPU_MEMORY_UTIL` (0.7-0.95) to balance memory usage
-
-## Quick Start Guide
-
-### For Impatient Users
-
-```bash
-# On head node (spark-6033)
-git clone https://github.com/mark-ramsey-ri/vllm-dgx-spark.git
-cd vllm-dgx-spark
-export HF_TOKEN="hf_your_token_here"  # Only if using gated models
-./start_head_vllm.sh
-
-# Wait for completion, then on worker node (spark-30e0)
-git clone https://github.com/mark-ramsey-ri/vllm-dgx-spark.git
-cd vllm-dgx-spark
-export HEAD_IP=169.254.103.56  # Use your head node's InfiniBand IP
-./start_worker_vllm.sh
-
-# Verify cluster
-docker exec ray-head ray status --address=127.0.0.1:6379
-
-# Test inference
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"meta-llama/Llama-3.3-70B-Instruct","messages":[{"role":"user","content":"Hello!"}]}'
-```
-
-That's it! Everything else is auto-detected.
-
-## Performance Troubleshooting
-
-### Low Throughput (<5 tokens/s)
-
-If you're experiencing extremely low performance, the most common cause is **InfiniBand/RoCE not being used**.
-
-**Quick diagnosis:**
-```bash
-# Run the InfiniBand diagnostic
-./check_infiniband.sh
-
-# Check vLLM logs for network mode
-docker exec ray-head tail -100 /var/log/vllm.log | grep -E "NCCL|NET"
-```
-
-**What to look for:**
-- ✅ **GOOD**: `NCCL INFO NET/IB` or `GPU Direct RDMA enabled` → Using InfiniBand/RoCE (~200 Gbps)
-- ❌ **BAD**: `NCCL INFO NET/Socket` → Using Ethernet fallback (~10 Gbps = 20x slower!)
-
-**Fix:**
-The startup scripts now automatically enable InfiniBand/RoCE by setting `NCCL_IB_DISABLE=0`. If you're still experiencing issues:
-
-1. **Run full diagnostics:**
-   ```bash
-   export SECOND_DGX_HOST=spark-30e0  # Your second node
-   ./vllm_system_checkout.sh
-   ```
-
-2. **Check the diagnostic report** for:
-   - Both Ray nodes showing as "Active"
-   - NCCL environment showing `NCCL_IB_DISABLE=0`
-   - InfiniBand devices detected
-
-3. **Verify InfiniBand connectivity:**
-   ```bash
-   # Test bandwidth between nodes
-   # On first node:
-   ib_write_bw
-
-   # On second node (replace IP):
-   ib_write_bw 169.254.103.56
-   ```
-
-**Expected performance:**
-- **Before fix (Ethernet)**: <5 tokens/s
-- **After fix (InfiniBand/RoCE)**: 50-100 tokens/s for Llama-3.3-70B
-
-For detailed information, see the [TROUBLESHOOTING.md](TROUBLESHOOTING.md) file.
 
 ## Troubleshooting
 
-### Worker Cannot Connect to Head
+### SSH Connection Failed
 
 ```bash
-# On worker, test connectivity
-nc -zv <HEAD_IP> 6379
+# Test SSH connectivity
+ssh <username>@<worker-ip> "hostname"
 
-# Check firewall rules
-sudo iptables -L | grep 6379
-
-# Verify head is running
-docker exec ray-head ray status --address=127.0.0.1:6379
+# If it fails, setup passwordless SSH:
+ssh-copy-id <username>@<worker-ip>
 ```
 
-### Version Mismatch Errors
+### Worker Not Joining Cluster
 
-Ensure Ray versions match between head and workers:
 ```bash
-# Check Ray version
-docker exec ray-head python3 -c "import ray; print(ray.__version__)"
-docker exec ray-worker-<hostname> python3 -c "import ray; print(ray.__version__)"
+# Check worker logs (from head node)
+ssh <username>@<worker-ip> "docker logs ray-worker"
+
+# Check Ray cluster status
+docker exec ray-head ray status --address=127.0.0.1:6380
 ```
 
-Both should show `2.51.0`. If not, update `RAY_VERSION` environment variable.
+### Low Throughput (Using Ethernet instead of InfiniBand)
 
-### Out of Memory Errors
-
-Reduce memory usage:
 ```bash
-export GPU_MEMORY_UTIL="0.60"  # Lower from 0.70
-export MAX_MODEL_LEN="1024"    # Reduce context window
+# Run NCCL diagnostics
+./checkout_setup.sh --nccl
+
+# Check vLLM logs for transport type
+docker exec ray-head tail -100 /var/log/vllm.log | grep -E "NCCL|NET"
+
+# Good: "NCCL INFO NET/IB" or "GPU Direct RDMA"
+# Bad:  "NCCL INFO NET/Socket" (falling back to Ethernet)
 ```
 
-Or use fewer GPUs per node and add more workers instead.
-
-### Model Download Fails
+### NCCL Communication Issues
 
 ```bash
-# Test HuggingFace authentication
-docker exec ray-head bash -c "
-  export HF_TOKEN=hf_your_token
-  huggingface-cli whoami
-"
+# Full InfiniBand check
+./checkout_setup.sh --infiniband
 
-# Manual download
-docker exec ray-head bash -c "
-  export HF_TOKEN=hf_your_token
-  huggingface-cli download meta-llama/Llama-3.3-70B-Instruct
-"
+# Check InfiniBand devices
+ibv_devinfo
+
+# If IB issues persist, check cables and run:
+ibdev2netdev  # Should show "(Up)" status
+```
+
+### Out of Memory
+
+```bash
+# Reduce memory utilization
+export GPU_MEMORY_UTIL=0.80
+./start_cluster.sh
+
+# Or reduce context length
+export MAX_MODEL_LEN=4096
+./start_cluster.sh
+
+# Or try a smaller model
+./switch_model.sh --list  # Pick single-node model
 ```
 
 ### vLLM Server Not Starting
 
-Check logs:
 ```bash
+# Check vLLM logs
 docker exec ray-head tail -100 /var/log/vllm.log
+
+# Check Ray status
+docker exec ray-head ray status --address=127.0.0.1:6380
+
+# Common issues:
+# - Insufficient GPUs for tensor-parallel-size
+# - Model download failed (check HF_TOKEN for gated models)
+# - NCCL timeout (check InfiniBand connectivity)
 ```
 
-Common issues:
-- Insufficient GPU memory → Reduce `GPU_MEMORY_UTIL` or `MAX_MODEL_LEN`
-- Ray cluster not ready → Wait 30s after starting workers
-- NCCL errors → Check InfiniBand configuration with `ibstatus`
-
-## Performance Tips
-
-1. **Use InfiniBand IPs**: Configure `HEAD_IP` and `WORKER_IP` to use IB interfaces (169.254.x.x range on DGX Spark)
-
-2. **Optimize Tensor Parallelism**: Set `TENSOR_PARALLEL` to total GPUs across all nodes for maximum performance
-
-3. **Tune Memory Utilization**: Start with `GPU_MEMORY_UTIL=0.70`, increase to 0.90 if stable
-
-4. **Monitor GPU Usage**: Use `nvidia-smi dmon` to ensure all GPUs are utilized during inference
-
-5. **Batch Requests**: vLLM automatically batches concurrent requests for better throughput
-
-## API Usage Examples
-
-### Python
-
-```python
-import openai
-
-client = openai.OpenAI(
-    base_url="http://<HEAD_IP>:8000/v1",
-    api_key="not-needed"  # vLLM doesn't require authentication
-)
-
-response = client.chat.completions.create(
-    model="meta-llama/Llama-3.3-70B-Instruct",
-    messages=[
-        {"role": "user", "content": "Explain quantum computing"}
-    ],
-    max_tokens=500
-)
-
-print(response.choices[0].message.content)
-```
-
-### Curl
+### Model Download Issues
 
 ```bash
-curl http://<HEAD_IP>:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "meta-llama/Llama-3.3-70B-Instruct",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "What is the capital of France?"}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 100
-  }'
+# Check if HF token is set (for gated models)
+echo $HF_TOKEN
+
+# Pre-download model manually
+./switch_model.sh -d <model-number>
+
+# Sync to worker
+./switch_model.sh -r <model-number>
 ```
 
-## Stopping the Cluster
+## System Diagnostics
 
-### Stop Worker Node
+Use `checkout_setup.sh` for comprehensive system checks:
+
 ```bash
-docker stop ray-worker-<hostname>
-docker rm ray-worker-<hostname>
+# Interactive menu
+./checkout_setup.sh
+
+# Quick overview
+./checkout_setup.sh --quick
+
+# Full InfiniBand check
+./checkout_setup.sh --infiniband
+
+# NCCL transport verification
+./checkout_setup.sh --nccl
+
+# Everything
+./checkout_setup.sh --full
 ```
 
-### Stop Head Node
-```bash
-docker stop ray-head
-docker rm ray-head
+## Performance Notes
+
+### Expected Performance (GPT-OSS 120B on 2x DGX Spark)
+
+| Metric | Value |
+|--------|-------|
+| Output Throughput | ~50-100 tok/s |
+| Time to First Token | ~2-5s |
+| Batch Throughput | ~400-700 tok/s |
+
+### Optimization Tips
+
+1. **Use InfiniBand IPs** - Ensure WORKER_IPS uses the 169.254.x.x InfiniBand addresses
+2. **Memory Utilization** - Set to 0.90 for max KV cache, reduce if OOM
+3. **Expert Parallel** - Enable for MoE models (gpt-oss, Mixtral)
+4. **Pre-download Models** - Use `switch_model.sh -d` to avoid download delays
+
+## File Structure
+
+```
+vllm-dgx-spark/
+├── README.md              # This file
+├── config.env             # Configuration template
+├── config.local.env       # Your local config (gitignored)
+├── .gitignore             # Git ignore patterns
+├── setup-env.sh           # Interactive setup script
+├── start_cluster.sh       # Main cluster startup script
+├── start_worker_vllm.sh   # Worker script (copied to workers by start_cluster.sh)
+├── stop_cluster.sh        # Cluster shutdown script
+├── switch_model.sh        # Model switching utility
+├── benchmark_current.sh   # Single model benchmark tool
+├── benchmark_all.sh       # Multi-model comparison benchmark
+├── checkout_setup.sh      # System diagnostics (InfiniBand, NCCL, GPU)
+└── benchmark_results/     # Benchmark output directory
 ```
 
-## Version Information
+## References
 
-- **Base Image**: `nvcr.io/nvidia/vllm:25.11-py3`
-- **Ray Version**: `2.51.0` (installed via pip, overrides container version)
-- **Python**: 3.x (from container)
-- **CUDA**: Included in NVIDIA container
-
-## Alternative: TensorRT-LLM
-
-For users interested in TensorRT-LLM as a potentially faster alternative to vLLM, we maintain a separate repository with comprehensive documentation and build scripts:
-
-**Repository**: `~/trt-dgx-spark/` (separate from this vLLM repository)
-
-**Key Info**:
-- TensorRT-LLM can be 3-5x faster than vLLM for Llama-70B
-- Requires building from source for DGX Spark GB10/SM120 GPU support
-- Build time: 2-4 hours
-- See `~/trt-dgx-spark/README.md` for complete documentation
-
----
-
-## Contributing
-
-Feel free to submit issues or pull requests for improvements.
+- [vLLM Documentation](https://docs.vllm.ai/)
+- [vLLM GitHub](https://github.com/vllm-project/vllm)
+- [NVIDIA vLLM Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/vllm)
+- [NVIDIA DGX Spark vLLM Playbook](https://build.nvidia.com/spark/vllm/stacked-sparks)
+- [NVIDIA NCCL over InfiniBand](https://build.nvidia.com/spark/nccl/stacked-sparks)
 
 ## License
 
-MIT License
-
-## Acknowledgments
-
-- Based on NVIDIA's vLLM container and DGX Spark architecture
-- Inspired by NVIDIA's Stacked Sparks playbook (with significant modifications for compatibility)
+MIT

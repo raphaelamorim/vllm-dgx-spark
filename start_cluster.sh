@@ -2,29 +2,50 @@
 set -euo pipefail
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DGX Spark vLLM Head Node - Production Setup Script
+# vLLM Cluster Startup Script
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Starts vLLM/Ray on head node and orchestrates worker nodes via SSH.
+# Run from head node - it will handle workers automatically.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Configuration
-IMAGE="${IMAGE:-nvcr.io/nvidia/vllm:25.11-py3}"
-NAME="${NAME:-ray-head}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration (config.local.env overrides config.env)
+if [ -f "${SCRIPT_DIR}/config.local.env" ]; then
+  source "${SCRIPT_DIR}/config.local.env"
+elif [ -f "${SCRIPT_DIR}/config.env" ]; then
+  source "${SCRIPT_DIR}/config.env"
+fi
+
+# Configuration (can be overridden by config.env or environment)
+IMAGE="${VLLM_IMAGE:-${IMAGE:-nvcr.io/nvidia/vllm:25.11-py3}}"
+NAME="${HEAD_CONTAINER_NAME:-${NAME:-ray-head}}"
 HF_CACHE="${HF_CACHE:-/raid/hf-cache}"
-HF_TOKEN="${HF_TOKEN:-}"  # Set via: export HF_TOKEN=hf_xxx
+HF_TOKEN="${HF_TOKEN:-}"
 RAY_VERSION="${RAY_VERSION:-2.52.0}"
 
 # Worker node configuration (for orchestrated setup)
-# WORKER_HOST must be set to enable automatic worker setup from head node
-# This should be the standard Ethernet IP for SSH access
-WORKER_HOST="${WORKER_HOST:-}"  # Required - no default (user must set this)
+# WORKER_IPS (or legacy WORKER_HOST) must be set to enable automatic worker setup
+WORKER_HOST="${WORKER_IPS:-${WORKER_HOST:-}}"  # Support both new and legacy names
 WORKER_USER="${WORKER_USER:-$(whoami)}"
-WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE}}"  # Worker's HF cache path (same as head by default)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE}}"
 
 # Model configuration
 MODEL="${MODEL:-openai/gpt-oss-120b}"
-TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"  # Default to 2 for distributed inference
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"   # Context length for Qwen2.5
-GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"  # Can be aggressive with smaller model
+TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"
+SWAP_SPACE="${SWAP_SPACE:-16}"
+SHM_SIZE="${SHM_SIZE:-16g}"
+ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-true}"
+TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-false}"
+LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+# Ports
+VLLM_PORT="${VLLM_PORT:-8000}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+RAY_PORT="${RAY_PORT:-6380}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Auto-detect Network Configuration
@@ -320,6 +341,7 @@ log "  Image:           ${IMAGE}"
 log "  Head IP:         ${HEAD_IP} (auto-detected)"
 log "  Model:           ${MODEL}"
 log "  Tensor Parallel: ${TENSOR_PARALLEL}"
+log "  Load Format:     ${LOAD_FORMAT}"
 log "  Ray Version:     ${RAY_VERSION}"
 log ""
 if [ -n "${WORKER_HOST}" ]; then
@@ -415,7 +437,7 @@ docker run -d \
   --name "${NAME}" \
   --gpus all \
   --network host \
-  --shm-size=16g \
+  --shm-size="${SHM_SIZE}" \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
   --device=/dev/infiniband \
@@ -589,16 +611,16 @@ docker exec "${NAME}" bash -lc "
   ray stop --force 2>/dev/null || true
   ray start --head \
     --node-ip-address=${HEAD_IP} \
-    --port=6380 \
+    --port=${RAY_PORT} \
     --dashboard-host=0.0.0.0 \
-    --dashboard-port=8265
+    --dashboard-port=${RAY_DASHBOARD_PORT}
 " >/dev/null
 
 log "  Ray head started, waiting for readiness..."
 
 # Wait for Ray to become ready
 for i in {1..30}; do
-  if docker exec "${NAME}" bash -lc "ray status --address='127.0.0.1:6380' >/dev/null 2>&1"; then
+  if docker exec "${NAME}" bash -lc "ray status --address='127.0.0.1:${RAY_PORT}' >/dev/null 2>&1"; then
     log "  ✅ Ray head is ready (${i}s)"
     break
   fi
@@ -639,8 +661,8 @@ if [ -n "${WORKER_HOST}" ]; then
   log "  Waiting for worker to join Ray cluster..."
   WORKER_JOINED=false
   for i in {1..120}; do
-    NODE_COUNT=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep -E '^ [0-9]+ node_' | wc -l" 2>/dev/null || echo "0")
-    CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
+    NODE_COUNT=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep -E '^ [0-9]+ node_' | wc -l" 2>/dev/null || echo "0")
+    CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
 
     if [ "${NODE_COUNT}" -ge 2 ]; then
       echo ""
@@ -676,10 +698,10 @@ else
   log "  Checking Ray cluster status..."
 
   # Show current cluster status
-  docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | head -15" || true
+  docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | head -15" || true
 
-  CURRENT_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep -E '^ [0-9]+ node' | awk '{print \$1}'" 2>/dev/null || echo "1")
-  CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
+  CURRENT_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep -E '^ [0-9]+ node' | awk '{print \$1}'" 2>/dev/null || echo "1")
+  CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
 
   log ""
   log "  Current cluster: ${CURRENT_NODES} node(s), ${CURRENT_GPUS} GPU(s)"
@@ -691,7 +713,7 @@ else
     log "     (Press Ctrl+C to abort and add workers manually)"
 
     for i in {1..30}; do
-      CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
+      CURRENT_GPUS=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep 'GPU:' | awk -F'/' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "1")
       if [ "${CURRENT_GPUS:-1}" -ge "${TENSOR_PARALLEL}" ]; then
         log "  ✅ Sufficient GPUs available: ${CURRENT_GPUS}"
         break
@@ -720,27 +742,38 @@ docker exec "${NAME}" bash -lc "pkill -f 'vllm serve' 2>/dev/null || true" || tr
 
 log "  Starting vLLM in background (this launches the server process)..."
 
+# Build vLLM command arguments
+VLLM_ARGS="--distributed-executor-backend ray"
+VLLM_ARGS="${VLLM_ARGS} --host 0.0.0.0"
+VLLM_ARGS="${VLLM_ARGS} --port ${VLLM_PORT}"
+VLLM_ARGS="${VLLM_ARGS} --tensor-parallel-size ${TENSOR_PARALLEL}"
+VLLM_ARGS="${VLLM_ARGS} --max-model-len ${MAX_MODEL_LEN}"
+VLLM_ARGS="${VLLM_ARGS} --gpu-memory-utilization ${GPU_MEMORY_UTIL}"
+VLLM_ARGS="${VLLM_ARGS} --swap-space ${SWAP_SPACE}"
+VLLM_ARGS="${VLLM_ARGS} --download-dir /root/.cache/huggingface"
+VLLM_ARGS="${VLLM_ARGS} --load-format ${LOAD_FORMAT}"
+
+# Add optional flags
+if [ "${ENABLE_EXPERT_PARALLEL}" = "true" ]; then
+  VLLM_ARGS="${VLLM_ARGS} --enable-expert-parallel"
+fi
+if [ "${TRUST_REMOTE_CODE}" = "true" ]; then
+  VLLM_ARGS="${VLLM_ARGS} --trust-remote-code"
+fi
+if [ -n "${EXTRA_ARGS}" ]; then
+  VLLM_ARGS="${VLLM_ARGS} ${EXTRA_ARGS}"
+fi
+
 # Start vLLM in background using nohup
 # Note: We do NOT set HF_HUB_OFFLINE=1 here because workers need to resolve the model name
-# The model should already be downloaded on all nodes via the pre-download step
 docker exec "${NAME}" bash -lc "
   export HF_HOME=/root/.cache/huggingface
-  export RAY_ADDRESS=127.0.0.1:6380
+  export RAY_ADDRESS=127.0.0.1:${RAY_PORT}
   export PYTHONUNBUFFERED=1
   export VLLM_LOGGING_LEVEL=INFO
   export VLLM_MXFP4_USE_MARLIN=1
 
-  nohup vllm serve ${MODEL} \
-    --distributed-executor-backend ray \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --tensor-parallel-size ${TENSOR_PARALLEL} \
-    --max-model-len ${MAX_MODEL_LEN} \
-    --gpu-memory-utilization ${GPU_MEMORY_UTIL} \
-    --swap-space 16 \
-    --enable-expert-parallel \
-    --download-dir \$HF_HOME \
-    > /var/log/vllm.log 2>&1 &
+  nohup vllm serve ${MODEL} ${VLLM_ARGS} > /var/log/vllm.log 2>&1 &
 
   sleep 1
 " || true
@@ -773,7 +806,7 @@ for i in $(seq 1 $MAX_WAIT); do
   SECS=$((ELAPSED % 60))
 
   # Check if vLLM is ready
-  if docker exec "${NAME}" bash -lc "curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1"; then
+  if docker exec "${NAME}" bash -lc "curl -sf http://127.0.0.1:${VLLM_PORT}/health >/dev/null 2>&1"; then
     echo ""
     log ""
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -853,11 +886,11 @@ log ""
 log "Step ${TOTAL_STEPS}/${TOTAL_STEPS}: Running health checks"
 
 # Check Ray status
-RAY_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:6380 2>/dev/null | grep 'Healthy:' -A1 | tail -1 | awk '{print \$1}'" || echo "0")
+RAY_NODES=$(docker exec "${NAME}" bash -lc "ray status --address=127.0.0.1:${RAY_PORT} 2>/dev/null | grep 'Healthy:' -A1 | tail -1 | awk '{print \$1}'" || echo "0")
 log "  Ray cluster: ${RAY_NODES} node(s) healthy"
 
 # Check vLLM models
-VLLM_MODEL=$(docker exec "${NAME}" bash -lc "curl -sf http://127.0.0.1:8000/v1/models 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])' 2>/dev/null" || echo "unknown")
+VLLM_MODEL=$(docker exec "${NAME}" bash -lc "curl -sf http://127.0.0.1:${VLLM_PORT}/v1/models 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])' 2>/dev/null" || echo "unknown")
 log "  vLLM model: ${VLLM_MODEL}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -878,8 +911,8 @@ fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "🌐 Services (accessible from network):"
-echo "  Ray Dashboard:  http://${PUBLIC_IP}:8265"
-echo "  vLLM API:       http://${PUBLIC_IP}:8000"
+echo "  Ray Dashboard:  http://${PUBLIC_IP}:${RAY_DASHBOARD_PORT}"
+echo "  vLLM API:       http://${PUBLIC_IP}:${VLLM_PORT}"
 echo ""
 
 if [ -n "${WORKER_HOST}" ]; then
@@ -907,10 +940,10 @@ fi
 
 echo "📊 Quick API Tests:"
 echo "  # List models"
-echo "  curl http://${PUBLIC_IP}:8000/v1/models"
+echo "  curl http://${PUBLIC_IP}:${VLLM_PORT}/v1/models"
 echo ""
 echo "  # Chat completion"
-echo "  curl http://${PUBLIC_IP}:8000/v1/chat/completions \\"
+echo "  curl http://${PUBLIC_IP}:${VLLM_PORT}/v1/chat/completions \\"
 echo "    -H 'Content-Type: application/json' \\"
 echo "    -d '{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
 echo ""
@@ -919,7 +952,7 @@ echo "  # View vLLM logs"
 echo "  docker exec ${NAME} tail -f /var/log/vllm.log"
 echo ""
 echo "  # Ray cluster status (check for worker nodes)"
-echo "  docker exec ${NAME} ray status --address=127.0.0.1:6380"
+echo "  docker exec ${NAME} ray status --address=127.0.0.1:${RAY_PORT}"
 echo ""
 echo "  # GPU utilization"
 echo "  watch -n 1 nvidia-smi"
