@@ -613,7 +613,7 @@ else
   echo "  Starting single-node cluster (this may take 2-3 minutes)..."
 fi
 
-"${SCRIPT_DIR}/start_head_vllm.sh" 2>&1 | tee /tmp/model_switch.log &
+"${SCRIPT_DIR}/start_cluster.sh" 2>&1 | tee /tmp/model_switch.log &
 STARTUP_PID=$!
 
 # Wait for API
