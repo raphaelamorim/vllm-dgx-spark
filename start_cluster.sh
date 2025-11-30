@@ -691,9 +691,9 @@ else
   # Manual mode: Wait for user to start workers
   log "Step 8/${TOTAL_STEPS}: Waiting for worker nodes"
   log ""
-  log "  ⚠️  IMPORTANT: Before proceeding, ensure all worker nodes have:"
-  log "     1. Downloaded the model: export MODEL=${MODEL} && bash start_worker_vllm.sh"
-  log "     2. Joined the Ray cluster"
+  log "  ⚠️  IMPORTANT: Set WORKER_HOST to start workers automatically:"
+  log "     export WORKER_HOST=<worker_ib_ip>"
+  log "     bash start_cluster.sh"
   log ""
   log "  Checking Ray cluster status..."
 
@@ -924,17 +924,13 @@ if [ -n "${WORKER_HOST}" ]; then
   echo "  ssh ${WORKER_USER}@${WORKER_HOST} 'cat ~/worker_setup.log'"
   echo ""
 else
-  echo "🔗 Next Steps - Add Worker Nodes:"
-  echo "  1. SSH to each worker node"
-  echo "  2. Run: export HEAD_IP=${HEAD_IP}"
-  echo "  3. Run: bash start_worker_vllm.sh"
-  echo ""
-  echo "  Note: Workers use IB/RoCE IP (${HEAD_IP}) for cluster communication"
-  echo "  Note: Worker IPs and network interfaces will be auto-detected!"
-  echo ""
-  echo "  For orchestrated setup (single command), set WORKER_HOST:"
-  echo "    export WORKER_HOST=<worker_ip>"
+  echo "🔗 Next Steps - Start Workers Automatically:"
+  echo "  Set WORKER_HOST and re-run start_cluster.sh:"
+  echo "    export WORKER_HOST=<worker_ib_ip>"
   echo "    bash start_cluster.sh"
+  echo ""
+  echo "  Workers will be started automatically via SSH."
+  echo "  Head IP for worker communication: ${HEAD_IP}"
   echo ""
 fi
 

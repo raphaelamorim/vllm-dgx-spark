@@ -234,12 +234,8 @@ echo "  ✓ Network interfaces (GLOO_IF, TP_IF, NCCL_IF, UCX_DEV)"
 echo "  ✓ InfiniBand HCAs (NCCL_IB_HCA)"
 echo ""
 echo "Next steps:"
-if [[ "$NODE_TYPE" == "head" ]]; then
-    echo "  Run: bash start_cluster.sh"
-elif [[ "$NODE_TYPE" == "worker" ]]; then
-    echo "  Run: bash start_worker_vllm.sh"
-else
-    echo "  Head node: bash start_cluster.sh"
-    echo "  Worker node: bash start_worker_vllm.sh"
-fi
+echo "  Run on head node: bash start_cluster.sh"
+echo ""
+echo "  Note: Workers are started automatically via SSH from the head node."
+echo "  Make sure WORKER_IPS is set in config.local.env or as environment variable."
 echo ""

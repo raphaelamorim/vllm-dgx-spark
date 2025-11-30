@@ -4,6 +4,10 @@ set -euo pipefail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DGX Spark vLLM Worker Node - Production Setup Script
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOTE: This script is automatically copied and executed on worker nodes
+# by start_cluster.sh via SSH. You should NOT run this script manually.
+# Instead, run start_cluster.sh on the head node with WORKER_HOST set.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Configuration
 IMAGE="${IMAGE:-nvcr.io/nvidia/vllm:25.11-py3}"
@@ -65,22 +69,13 @@ if [ -z "${HEAD_IP:-}" ]; then
   echo "❌ ERROR: HEAD_IP is not set"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
-  echo "⚠️  The HEAD_IP environment variable must be set before starting a worker node."
+  echo "⚠️  This script should be run automatically by start_cluster.sh on the head node."
   echo ""
-  echo "Prerequisites:"
-  echo "  1. ✅ Head node must be running first"
-  echo "  2. ✅ You need the head node's InfiniBand/RoCE IP"
+  echo "To start the cluster with workers:"
+  echo "  1. On the head node, set WORKER_HOST to the worker's InfiniBand IP"
+  echo "  2. Run: bash start_cluster.sh"
   echo ""
-  echo "To find the head node IP:"
-  echo "  - Check the output from start_cluster.sh (shown as 'Head IP')"
-  echo "  - OR run on head node: ibdev2netdev  # to find the IB interface"
-  echo "  - Then: ip addr show <interface>"
-  echo ""
-  echo "Then set HEAD_IP and run this script:"
-  echo "  export HEAD_IP=<head_node_ib_ip>"
-  echo "  bash start_worker_vllm.sh"
-  echo ""
-  echo "Note: Everything else (WORKER_IP, network interfaces) will be auto-detected!"
+  echo "The head node will automatically SSH to workers and start them."
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
