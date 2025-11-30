@@ -7,7 +7,7 @@ Deploy [vLLM](https://github.com/vllm-project/vllm) on a dual-node NVIDIA DGX Sp
 - **Single-command deployment** - Start entire cluster from head node via SSH
 - **Auto-detection** of InfiniBand IPs, network interfaces, and HCA devices
 - **Generic scripts** that work on any DGX Spark pair
-- **15+ model presets** including Llama, Qwen, Mixtral, DeepSeek
+- **13 model presets** including Llama, Qwen, Mixtral, Gemma
 - **InfiniBand RDMA** for high-speed inter-node communication (200Gb/s)
 - **Comprehensive benchmarking** with multiple test profiles
 
@@ -303,7 +303,6 @@ All models run across both DGX Spark nodes (TP=2) for maximum performance.
 | 11 | `meta-llama/Llama-3.1-70B-Instruct` | ~65GB | High quality (needs HF token) |
 | 12 | `microsoft/phi-4` | ~14-16GB | Small but smart |
 | 13 | `google/gemma-2-27b-it` | ~24-28GB | Strong mid-size (needs HF token) |
-| 14 | `deepseek-ai/DeepSeek-V2-Lite-Chat` | ~12-16GB | MoE, reasoning tuned |
 
 ## Benchmark Profiles
 

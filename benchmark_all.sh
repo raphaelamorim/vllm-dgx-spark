@@ -50,7 +50,6 @@ MODELS=(
   "meta-llama/Llama-3.1-70B-Instruct"
   "microsoft/phi-4"
   "google/gemma-2-27b-it"
-  "deepseek-ai/DeepSeek-V2-Lite-Chat"
 )
 
 MODEL_NAMES=(
@@ -67,16 +66,15 @@ MODEL_NAMES=(
   "Llama-3.1-70B"
   "Phi-4"
   "Gemma2-27B"
-  "DeepSeek-V2-Lite"
 )
 
 # All models run across both nodes (TP=2)
 MODEL_NODES=(
-  2 2 2 2 2 2 2 2 2 2 2 2 2 2
+  2 2 2 2 2 2 2 2 2 2 2 2 2
 )
 
 MODEL_NEEDS_TOKEN=(
-  false false false false false false false false false true true false true false
+  false false false false false false false false false true true false true
 )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

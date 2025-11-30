@@ -38,7 +38,6 @@ MODELS=(
   "meta-llama/Llama-3.1-70B-Instruct"
   "microsoft/phi-4"
   "google/gemma-2-27b-it"
-  "deepseek-ai/DeepSeek-V2-Lite-Chat"
 )
 
 # Human-readable model descriptions
@@ -56,7 +55,6 @@ MODEL_NAMES=(
   "Llama-3.1-70B (70B params, ~65GB, high quality)"
   "Phi-4 (15B params, ~14-16GB, small but smart)"
   "Gemma2-27B (27B params, ~24-28GB, strong mid-size)"
-  "DeepSeek-V2-Lite (16B MoE, ~12-16GB, very fast, reasoning tuned)"
 )
 
 # Tensor Parallelism (number of GPUs needed)
@@ -75,7 +73,6 @@ MODEL_TP=(
   2    # Llama-3.1-70B
   2    # Phi-4
   2    # Gemma2-27B
-  2    # DeepSeek-V2-Lite
 )
 
 # Number of nodes required (all models use 2 nodes)
@@ -93,7 +90,6 @@ MODEL_NODES=(
   2    # Llama-3.1-70B
   2    # Phi-4
   2    # Gemma2-27B
-  2    # DeepSeek-V2-Lite
 )
 
 # GPU Memory Utilization (0.90 default)
@@ -111,7 +107,6 @@ MODEL_GPU_MEM=(
   0.90  # Llama-3.1-70B
   0.90  # Phi-4
   0.90  # Gemma2-27B
-  0.90  # DeepSeek-V2-Lite
 )
 
 # Max model length (context window)
@@ -129,7 +124,6 @@ MODEL_MAX_LEN=(
   131072 # Llama-3.1-70B - 128k context
   16384  # Phi-4
   8192   # Gemma2-27B
-  32768  # DeepSeek-V2-Lite
 )
 
 # Trust remote code flag
@@ -147,7 +141,6 @@ MODEL_TRUST_REMOTE=(
   false  # Llama-3.1-70B
   true   # Phi-4 - requires trust_remote_code
   false  # Gemma2-27B
-  true   # DeepSeek-V2-Lite - requires trust_remote_code
 )
 
 # Requires HF token (gated models)
@@ -165,7 +158,6 @@ MODEL_NEEDS_TOKEN=(
   true   # Llama-3.1-70B - gated
   false  # Phi-4
   true   # Gemma2-27B - gated
-  false  # DeepSeek-V2-Lite
 )
 
 # Enable expert parallel for MoE models
@@ -183,7 +175,6 @@ MODEL_EXPERT_PARALLEL=(
   false  # Llama-3.1-70B
   false  # Phi-4
   false  # Gemma2-27B
-  true   # DeepSeek-V2-Lite - MoE
 )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
