@@ -830,7 +830,7 @@ log "━━━━━━━━━━━━━━━━━━━━━━━━━
 log "  🔄 MODEL LOADING IN PROGRESS"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log ""
-log "  This process typically takes 2-5 minutes depending on model size."
+log "  This process typically takes 5-20 minutes depending on model size."
 log "  The server will:"
 log "    1. Load model weights into GPU memory"
 log "    2. Initialize tensor parallelism across GPUs"
