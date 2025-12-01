@@ -31,9 +31,9 @@ WORKER_USER="${WORKER_USER:-$(whoami)}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE}}"
 
 # Model configuration
-MODEL="${MODEL:-mistralai/Mistral-7B-Instruct-v0.3}"
+MODEL="${MODEL:-microsoft/phi-4}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"
 SWAP_SPACE="${SWAP_SPACE:-16}"
 SHM_SIZE="${SHM_SIZE:-16g}"
@@ -476,24 +476,11 @@ log "  Container started successfully"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 4/${TOTAL_STEPS}: Installing RDMA/InfiniBand libraries for NCCL"
+log "Step 4/${TOTAL_STEPS}: Verifying RDMA/InfiniBand libraries for NCCL"
 log "  These libraries are required for NCCL to use InfiniBand/RoCE instead of Ethernet"
-if ! docker exec "${NAME}" bash -lc "
-  apt-get update -qq >/dev/null 2>&1
-  apt-get install -y -qq \
-    infiniband-diags \
-    libibverbs1 \
-    librdmacm1 \
-    rdma-core \
-    ibverbs-providers \
-    >/dev/null 2>&1
-"; then
-  log "  ⚠️  Warning: Could not install RDMA libraries (may already be present)"
-fi
-
-# Verify RDMA libraries are available
+# The spark-vllm container already has RDMA libraries installed - just verify
 if docker exec "${NAME}" bash -lc "ldconfig -p 2>/dev/null | grep -q libibverbs"; then
-  log "  ✅ RDMA libraries installed (libibverbs, librdmacm)"
+  log "  ✅ RDMA libraries available (libibverbs, librdmacm)"
 else
   log "  ⚠️  Warning: RDMA libraries may not be properly installed"
   log "     NCCL may fall back to Socket transport (slower)"
@@ -501,19 +488,30 @@ fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-log "Step 5/${TOTAL_STEPS}: Installing Ray ${RAY_VERSION} and fastsafetensors"
-if ! docker exec "${NAME}" bash -lc "pip install -q -U --root-user-action=ignore 'ray==${RAY_VERSION}' 'vllm[fastsafetensors]'"; then
-  error "Failed to install Ray and fastsafetensors"
-fi
+log "Step 5/${TOTAL_STEPS}: Verifying container has required dependencies"
+# The spark-vllm container already has Ray, vLLM, and fastsafetensors properly built for CUDA 13
+# Do NOT pip install anything here as it would overwrite the custom builds
 
-# Verify Ray version
+# Verify Ray is available
 INSTALLED_RAY_VERSION=$(docker exec "${NAME}" python3 -c "import ray; print(ray.__version__)" 2>/dev/null || echo "unknown")
-if [ "${INSTALLED_RAY_VERSION}" != "${RAY_VERSION}" ]; then
-  error "Ray version mismatch: expected ${RAY_VERSION}, got ${INSTALLED_RAY_VERSION}"
+if [ "${INSTALLED_RAY_VERSION}" == "unknown" ]; then
+  error "Ray not found in container - ensure you're using the correct spark-vllm image"
 fi
+log "  Ray ${INSTALLED_RAY_VERSION} available"
 
-log "  Ray ${INSTALLED_RAY_VERSION} installed"
-log "  fastsafetensors installed (GPU Direct Storage for faster model loading)"
+# Verify vLLM is available
+INSTALLED_VLLM_VERSION=$(docker exec "${NAME}" python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+if [ "${INSTALLED_VLLM_VERSION}" == "unknown" ]; then
+  error "vLLM not found in container - ensure you're using the correct spark-vllm image"
+fi
+log "  vLLM ${INSTALLED_VLLM_VERSION} available"
+
+# Verify CUDA is working
+CUDA_AVAILABLE=$(docker exec "${NAME}" python3 -c "import torch; print(torch.cuda.is_available())" 2>/dev/null || echo "False")
+if [ "${CUDA_AVAILABLE}" != "True" ]; then
+  error "PyTorch CUDA not available - container may have incorrect PyTorch build"
+fi
+log "  PyTorch CUDA available"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
